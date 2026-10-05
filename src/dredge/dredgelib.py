@@ -1,4 +1,5 @@
 import warnings
+from collections.abc import Callable
 
 import numpy as np
 import scipy.linalg as la
@@ -7,7 +8,7 @@ import torch.nn.functional as F
 from scipy.linalg import solve
 from tqdm.auto import trange
 
-from .motion_util import get_bins, get_window_domains, spike_raster
+from .motion_util import get_window_domains
 
 DEFAULT_LAMBDA_T = 1.0
 DEFAULT_EPS = 1e-3
@@ -16,16 +17,26 @@ DEFAULT_EPS = 1e-3
 # -- linear algebra, Newton method solver, block tridiagonal (Thomas) solver
 
 
-def laplacian(n, wink=True, eps=DEFAULT_EPS, lambd=1.0, ridge_mask=None):
+def laplacian(
+    n,
+    wink=True,
+    eps=DEFAULT_EPS,
+    lambd=1.0,
+    ridge_mask=None,
+    wink_start: bool | None = None,
+):
     """Construct a discrete Laplacian operator (plus eps*identity)."""
+    if wink_start is None:
+        wink_start = wink
     lap = np.zeros((n, n))
     if ridge_mask is None:
         diag = lambd + eps
     else:
         diag = lambd + eps * ridge_mask
     np.fill_diagonal(lap, diag)
-    if wink:
+    if wink_start:
         lap[0, 0] -= 0.5 * lambd
+    if wink:
         lap[-1, -1] -= 0.5 * lambd
     # fill diagonal using a for loop for space reasons when this is large
     for i in range(n - 1):
@@ -59,6 +70,7 @@ def newton_rhs(
     Ub_prevcur=None,
     Db_curprev=None,
     Ub_curprev=None,
+    prior_rhs=None,
 ):
     """Newton step right hand side
 
@@ -79,6 +91,8 @@ def newton_rhs(
         + (Ub_curprev * Db_curprev).sum(1)
         - (Ub_prevcur * Db_prevcur).sum(0)
     )
+    if prior_rhs is not None:
+        rhs += prior_rhs
 
     return rhs
 
@@ -92,6 +106,7 @@ def newton_solve_rigid(
     Ub_prevcur=None,
     Db_curprev=None,
     Ub_curprev=None,
+    prior_rhs=None,
 ):
     """Solve the rigid Newton step
 
@@ -110,6 +125,7 @@ def newton_solve_rigid(
         Ub_prevcur=Ub_prevcur,
         Db_curprev=Db_curprev,
         Ub_curprev=Ub_curprev,
+        prior_rhs=prior_rhs,
     )
     try:
         p = solve(Sigma0inv + negHU, targ, assume_a="pos")
@@ -152,26 +168,40 @@ def thomas_solve(
     """
     Ds = np.asarray(Ds, dtype=np.float64)
     Us = np.asarray(Us, dtype=np.float64)
+    B, T, T_ = Ds.shape
+    assert T == T_
+    assert Us.shape == Ds.shape
+
+    # spatial prior's diagonal and off-diagonal block laplacian coefficients
+    lambd_s_diag = np.full(B, float(lambda_s))
+    lambd_s_diag[[0, -1]] = lambda_s / 2
+    lambd_s_offdiag = -lambda_s / 2
+
     online = P_prev is not None
     online_kw_rhs = online_kw_hess = lambda b: {}
     if online:
         assert Ds_prevcur is not None
         assert Us_prevcur is not None
+        # priors' terms linking each window's first bin to P_prev's last bin
+        p_last = P_prev[:, -1].astype(np.float64)
+        prior_rhs = np.zeros((B, T))
+        prior_rhs[:, 0] = 0.5 * lambda_t * p_last
+        if B > 1 and lambda_s:
+            prior_rhs[:, 0] += 0.5 * lambd_s_diag * p_last
+            prior_rhs[1:, 0] += 0.5 * lambd_s_offdiag * p_last[:-1]
+            prior_rhs[:-1, 0] += 0.5 * lambd_s_offdiag * p_last[1:]
         online_kw_rhs = lambda b: dict(  # noqa
             Pb_prev=P_prev[b].astype(np.float64, copy=False),
             Db_prevcur=Ds_prevcur[b].astype(np.float64, copy=False),
             Ub_prevcur=Us_prevcur[b].astype(np.float64, copy=False),
             Db_curprev=Ds_curprev[b].astype(np.float64, copy=False),
             Ub_curprev=Us_curprev[b].astype(np.float64, copy=False),
+            prior_rhs=prior_rhs[b],
         )
         online_kw_hess = lambda b: dict(  # noqa
             Ub_prevcur=Us_prevcur[b].astype(np.float64, copy=False),
             Ub_curprev=Us_curprev[b].astype(np.float64, copy=False),
         )
-
-    B, T, T_ = Ds.shape
-    assert T == T_
-    assert Us.shape == Ds.shape
 
     # figure out which temporal bins are included in the problem
     # these are used to figure out where epsilon can be added
@@ -180,7 +210,10 @@ def thomas_solve(
     had_weights[~had_weights.any(axis=1)] = 1
 
     # temporal prior matrix
-    L_t = [laplacian(T, eps=eps, lambd=lambda_t, ridge_mask=w) for w in had_weights]
+    L_t = [
+        laplacian(T, eps=eps, lambd=lambda_t, ridge_mask=w, wink_start=not online)
+        for w in had_weights
+    ]
     extra = dict(L_t=L_t)
 
     # just solve independent problems when there's no spatial regularization
@@ -195,10 +228,14 @@ def thomas_solve(
         return P, extra
 
     # spatial prior is a sparse, block tridiagonal kronecker product
-    # the first and last diagonal blocks are
-    Lambda_s_diagb = laplacian(T, eps=eps, lambd=lambda_s / 2, ridge_mask=had_weights[0])
-    # and the off-diagonal blocks are
-    Lambda_s_offdiag = laplacian(T, eps=0, lambd=-lambda_s / 2)
+    Lambda_s_diagb = laplacian(
+        T,
+        eps=eps,
+        lambd=lambd_s_diag[0],
+        ridge_mask=had_weights[0],
+        wink_start=not online,
+    )
+    Lambda_s_offdiag = laplacian(T, eps=0, lambd=lambd_s_offdiag, wink_start=not online)
 
     # initialize block-LU stuff and forward variable
     alpha_hat_b = (
@@ -206,20 +243,21 @@ def thomas_solve(
         + Lambda_s_diagb
         + neg_hessian_likelihood_term(Us[0], **online_kw_hess(0))
     )
-    targets = np.c_[
-        Lambda_s_offdiag, newton_rhs(Us[0], Ds[0], **online_kw_rhs(0))
-    ]
+    targets = np.c_[Lambda_s_offdiag, newton_rhs(Us[0], Ds[0], **online_kw_rhs(0))]
     res = solve(alpha_hat_b, targets, assume_a="pos")
     assert res.shape == (T, T + 1)
     gamma_hats = [res[:, :T]]
     ys = [res[:, T]]
 
     # forward pass
-    for b in (trange(1, B, desc="Solve") if pbar else range(1, B)):
-        if b < B - 1:
-            Lambda_s_diagb = laplacian(T, eps=eps, lambd=lambda_s, ridge_mask=had_weights[b])
-        else:
-            Lambda_s_diagb = laplacian(T, eps=eps, lambd=lambda_s / 2, ridge_mask=had_weights[b])
+    for b in trange(1, B, desc="Solve") if pbar else range(1, B):
+        Lambda_s_diagb = laplacian(
+            T,
+            eps=eps,
+            lambd=lambd_s_diag[b],
+            ridge_mask=had_weights[b],
+            wink_start=not online,
+        )
 
         Ab = (
             L_t[b]
@@ -280,18 +318,14 @@ def get_weights(
         nspikes_threshold_low, amp_threshold_low = weights_threshold_low
         unif = np.full_like(windows[0], 1 / len(windows[0]))
         weights_threshold_low = (
-            scale_fn(amp_threshold_low)
-            * windows
-            @ (nspikes_threshold_low * unif)
+            scale_fn(amp_threshold_low) * windows @ (nspikes_threshold_low * unif)
         )
         weights_threshold_low = weights_threshold_low[:, None]
     if isinstance(weights_threshold_high, tuple):
         nspikes_threshold_high, amp_threshold_high = weights_threshold_high
         unif = np.full_like(windows[0], 1 / len(windows[0]))
         weights_threshold_high = (
-            scale_fn(amp_threshold_high)
-            * windows
-            @ (nspikes_threshold_high * unif)
+            scale_fn(amp_threshold_high) * windows @ (nspikes_threshold_high * unif)
         )
         weights_threshold_high = weights_threshold_high[:, None]
     weights_thresh = weights_orig.copy()
@@ -309,8 +343,7 @@ def threshold_correlation_matrix(
     max_dt_s=0,
     in_place=False,
     bin_s=1,
-    t_offset_bins=None,
-    T=None,
+    t_offset_bins: int = 0,
     soft=True,
 ):
     if mincorr_percentile is not None:
@@ -336,19 +369,10 @@ def threshold_correlation_matrix(
             Ss = np.square((Cs >= mincorr) * Cs)
         else:
             Ss = (Cs >= mincorr).astype(Cs.dtype)
-    if (
-        max_dt_s is not None
-        and max_dt_s > 0
-        and T is not None
-        and max_dt_s < T
-    ):
-        tt0 = bin_s * np.arange(T)
-        tt1 = tt0
-        if t_offset_bins:
-            tt1 = tt0 + t_offset_bins
-        dt = tt1[:, None] - tt0[None, :]
-        mask = (np.abs(dt) <= max_dt_s).astype(Ss.dtype)
-        Ss *= mask[None]
+    if max_dt_s:
+        Ta, Tb = Ss.shape[-2:]
+        dt_bins = np.arange(Ta)[:, None] + t_offset_bins - np.arange(Tb)[None, :]
+        Ss *= np.abs(dt_bins) * bin_s <= max_dt_s
     return Ss, mincorr
 
 
@@ -358,8 +382,10 @@ def weight_correlation_matrix(
     windows,
     raster,
     depth_bin_edges,
-    time_bin_edges,
+    bin_s: float,
     raster_kw,
+    raster_b: np.ndarray | None = None,
+    t_offset_bins: int = 0,
     mincorr=0.0,
     mincorr_percentile=None,
     mincorr_percentile_nneighbs=20,
@@ -369,19 +395,21 @@ def weight_correlation_matrix(
     do_window_weights=True,
     weights_threshold_low=0.0,
     weights_threshold_high=np.inf,
+    soft=True,
     pbar=True,
     in_place=False,
 ):
-    """Transform the correlation matrix into the weights used in optimization."""
-    extra = {}
+    """Transform the correlation matrix into the weights used in optimization.
 
+    If raster_b is supplied, Cs[:, i, j] correlates time bin i of raster with
+    time bin j of raster_b, as in xcorr_windows().
+    """
     Ds = np.asarray(Ds)
     Cs = np.asarray(Cs)
     if Ds.ndim == 2:
         Ds = Ds[None]
         Cs = Cs[None]
     B, T, T_ = Ds.shape
-    assert T == T_
     assert Ds.shape == Cs.shape
     extra = {}
 
@@ -391,9 +419,10 @@ def weight_correlation_matrix(
         mincorr_percentile=mincorr_percentile,
         mincorr_percentile_nneighbs=mincorr_percentile_nneighbs,
         max_dt_s=max_dt_s,
-        bin_s=time_bin_edges[1] - time_bin_edges[0],
-        T=T,
+        bin_s=bin_s,
+        t_offset_bins=t_offset_bins,
         in_place=in_place,
+        soft=soft,
     )
     extra["S"] = Ss
     extra["mincorr"] = mincorr
@@ -401,21 +430,27 @@ def weight_correlation_matrix(
     if not do_window_weights:
         return Ss, extra
 
-    # get weights
-    L_t = lambda_t * laplacian(T, eps=max(1e-5, eps))
-    weights_orig, weights_thresh, Pind = get_weights(
-        Ds,
-        Ss,
-        L_t,
-        windows,
-        raster,
-        depth_bin_edges,
-        time_bin_edges,
-        raster_kw,
+    weights_kw = dict(
         weights_threshold_low=weights_threshold_low,
         weights_threshold_high=weights_threshold_high,
         pbar=pbar,
     )
+    weights_orig, weights_thresh, Pind = get_weights(
+        Ds, Ss, None, windows, raster, depth_bin_edges, None, raster_kw, **weights_kw
+    )
+    weights_thresh_b = weights_thresh
+    if raster_b is not None:
+        _, weights_thresh_b, _ = get_weights(
+            Ds,
+            Ss,
+            None,
+            windows,
+            raster_b,
+            depth_bin_edges,
+            None,
+            raster_kw,
+            **weights_kw,
+        )
     extra["weights_orig"] = weights_orig
     extra["weights_thresh"] = weights_thresh
     extra["Pind"] = Pind
@@ -423,18 +458,13 @@ def weight_correlation_matrix(
     # update noise model. we deliberately divide by zero and inf here.
     Us = Ss if in_place else np.zeros_like(Ss)
     with np.errstate(divide="ignore"):
-        # low mem impl of U = abs(1/(1/weights_thresh+1/weights_thresh'+1/S))
+        # low mem impl of U = abs(1/(1/weights_thresh+1/weights_thresh_b'+1/S))
         np.reciprocal(Ss, out=Us)
-        invW = 1.0 / weights_thresh
-        Us += invW[:, :, None]
-        Us += invW[:, None, :]
+        Us += 1.0 / weights_thresh[:, :, None]
+        Us += 1.0 / weights_thresh_b[:, None, :]
         np.reciprocal(Us, out=Us)
         # handles possible -0s that cause issues elsewhere
         np.abs(Us, out=Us)
-        # more readable equivalent:
-        # for b in range(B):
-        #     invWbtt = invW[b, :, None] + invW[b, None, :]
-        #     Us[b] = np.abs(1.0 / (invWbtt + 1.0 / Ss[b]))
     extra["U"] = Us
 
     return Us, extra
@@ -453,6 +483,7 @@ def xcorr_windows(
     bin_um=1,
     max_disp_um=None,
     max_dt_bins=None,
+    t_offset_bins: int = 0,
     pbar=True,
     centered=True,
     normalized=True,
@@ -462,7 +493,8 @@ def xcorr_windows(
     """Main computational function
 
     Compute pairwise (time x time) maximum cross-correlation and displacement
-    matrices in each nonrigid window.
+    matrices in each nonrigid window. Time bin i of raster_a is t_offset_bins
+    later than time bin i of raster_b.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -525,6 +557,7 @@ def xcorr_windows(
             centered=centered,
             normalized=normalized,
             max_dt_bins=max_dt_bins,
+            t_offset_bins=t_offset_bins,
         )
 
     return Ds, Cs, max_disp_um
@@ -542,6 +575,7 @@ def calc_corr_decent_pair(
     centered=True,
     possible_displacement=None,
     max_dt_bins=None,
+    t_offset_bins: int = 0,
     device=None,
 ):
     """Weighted pairwise cross-correlation
@@ -585,9 +619,7 @@ def calc_corr_decent_pair(
     # pick torch device if unset
     if device is None:
         device = (
-            torch.device("cuda")
-            if torch.cuda.is_available()
-            else torch.device("cpu")
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         )
 
     # process rasters into the tensors we need for conv2ds below
@@ -600,9 +632,9 @@ def calc_corr_decent_pair(
     C = np.zeros((Ta, Tb), dtype=np.float32)
     for i in range(0, Ta, batch_size):
         for j in range(0, Tb, batch_size):
-            dt_bins = min(
-                abs(i - j), abs(i + batch_size - j), abs(i - j - batch_size)
-            )
+            dt_low = i + t_offset_bins - (j + batch_size - 1)
+            dt_high = i + batch_size - 1 + t_offset_bins - j
+            dt_bins = 0 if dt_low <= 0 <= dt_high else min(abs(dt_low), abs(dt_high))
             if max_dt_bins and dt_bins > max_dt_bins:
                 continue
             weights_ = weights
@@ -740,9 +772,7 @@ def normxcorr1d(
 
     # compute variances for denominator, using var X = E[X^2] - (EX)^2
     if normalized:
-        var_template = conv1d(
-            onesx, wt * template, padding=padding
-        )
+        var_template = conv1d(onesx, wt * template, padding=padding)
         var_template /= Nx
         var_x = conv1d(wx * x, weights, padding=padding)
         var_x /= Nx
@@ -780,9 +810,7 @@ def scipy_conv1d(input, weights, padding="valid"):
         length_out = length - 2 * (kernel_size // 2)
     elif isinstance(padding, int):
         mode = "valid"
-        input = np.pad(
-            input, [*[(0, 0)] * (input.ndim - 1), (padding, padding)]
-        )
+        input = np.pad(input, [*[(0, 0)] * (input.ndim - 1), (padding, padding)])
         length_out = length - (kernel_size - 1) + 2 * padding
     else:
         raise ValueError(f"Unknown padding {padding}")
@@ -793,3 +821,101 @@ def scipy_conv1d(input, weights, padding="valid"):
             output[m, c] = correlate(input[m, 0], weights[c, 0], mode=mode)
 
     return output
+
+
+# -- online registration
+
+
+def online_displacement(
+    get_raster: Callable[[int, int], np.ndarray],
+    T_total: int,
+    T_chunk: int,
+    windows: np.ndarray,
+    spatial_bin_edges_um: np.ndarray,
+    win_scale_um: float,
+    bin_s: float,
+    xcorr_kw: dict,
+    weights_kw: dict,
+    thomas_kw: dict,
+    raster_kw: dict | None = None,
+    save_full: bool = False,
+    pbar: bool = True,
+) -> tuple[np.ndarray, dict]:
+    """Estimate displacement one chunk at a time, conditioning on the previous chunk
+
+    get_raster(t_start, t_end) returns the raster for time bins t_start:t_end,
+    with shape (windows.shape[1], t_end - t_start).
+    """
+    P = np.empty((len(windows), T_total), dtype=np.float32)
+    extra = dict(mincorrs=[])
+    if save_full:
+        extra.update(D=[], C=[], S=[], D01=[], C01=[], S01=[])
+    weights_kw = dict(
+        raster_kw=raster_kw, pbar=False, in_place=not save_full, **weights_kw
+    )
+
+    chunk_starts = range(0, T_total, T_chunk)
+    if pbar:
+        chunk_starts = trange(0, T_total, T_chunk, desc="Online chunks")
+    t0, raster0 = 0, None
+    for t1 in chunk_starts:
+        t2 = min(T_total, t1 + T_chunk)
+        raster1 = get_raster(t1, t2)
+
+        Ds1, Cs1, max_disp_um = xcorr_windows(
+            raster1, windows, spatial_bin_edges_um, win_scale_um, **xcorr_kw
+        )
+        Us1, wextra = weight_correlation_matrix(
+            Ds1, Cs1, windows, raster1, spatial_bin_edges_um, bin_s, **weights_kw
+        )
+        mincorr1 = wextra["mincorr"]
+        extra["mincorrs"].append(mincorr1)
+        if save_full:
+            extra["D"].append(Ds1)
+            extra["C"].append(Cs1)
+            extra["S"].append(Us1)
+
+        if raster0 is None:
+            P[:, t1:t2], _ = thomas_solve(Ds1, Us1, **thomas_kw)
+            t0, raster0 = t1, raster1
+            continue
+
+        Ds10, Cs10, _ = xcorr_windows(
+            raster1,
+            windows,
+            spatial_bin_edges_um,
+            win_scale_um,
+            raster_b=raster0,
+            t_offset_bins=t1 - t0,
+            **xcorr_kw,
+        )
+        Us10, _ = weight_correlation_matrix(
+            Ds10,
+            Cs10,
+            windows,
+            raster1,
+            spatial_bin_edges_um,
+            bin_s,
+            raster_b=raster0,
+            t_offset_bins=t1 - t0,
+            **dict(weights_kw, mincorr=mincorr1, mincorr_percentile=None),
+        )
+        if save_full:
+            extra["D01"].append(Ds10)
+            extra["C01"].append(Cs10)
+            extra["S01"].append(Us10)
+
+        P[:, t1:t2], _ = thomas_solve(
+            Ds1,
+            Us1,
+            P_prev=P[:, t0:t1],
+            Ds_curprev=Ds10,
+            Us_curprev=Us10,
+            Ds_prevcur=-Ds10.transpose(0, 2, 1),
+            Us_prevcur=Us10.transpose(0, 2, 1),
+            **thomas_kw,
+        )
+        t0, raster0 = t1, raster1
+
+    extra["max_disp_um"] = max_disp_um
+    return P, extra

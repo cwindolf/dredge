@@ -1,9 +1,6 @@
-from tqdm.auto import trange
-
 import numpy as np
 
-from .dredgelib import (thomas_solve, threshold_correlation_matrix,
-                        xcorr_windows)
+from .dredgelib import online_displacement
 from .motion_util import get_motion_estimate, get_windows
 
 
@@ -100,13 +97,13 @@ def register_online_lfp(
         device=device,
         **xcorr_kw,
     )
-    threshold_kw = dict(
+    weights_kw = dict(
+        mincorr=mincorr,
+        mincorr_percentile=mincorr_percentile,
         mincorr_percentile_nneighbs=mincorr_percentile_nneighbs,
-        in_place=True,
         soft=soft,
-        # max_dt_s=weights_kw["max_dt_s"],  # max_dt not implemented for lfp at this point
         max_dt_s=max_dt_s,
-        bin_s=1 / fs,  # only relevant for max_dt_s
+        do_window_weights=False,
     )
 
     # get windows
@@ -120,97 +117,21 @@ def register_online_lfp(
         zero_threshold=1e-5,
         rigid=rigid,
     )
-    B = len(windows)
-    extra = dict(window_centers=window_centers, windows=windows)
-
-    # -- allocate output and initialize first chunk
-    P_online = np.empty((B, T_total), dtype=np.float32)
-    # below, t0 is start of prev chunk, t1 start of cur chunk, t2 end of cur
-    t0, t1 = 0, T_chunk
-    traces0 = lfp_recording.get_traces(start_frame=t0, end_frame=t1)
-    Ds0, Cs0, max_disp_um = xcorr_windows(
-        traces0.T, windows, geom[:, 1], win_scale_um, **full_xcorr_kw
+    P_online, extra = online_displacement(
+        lambda t0, t1: lfp_recording.get_traces(start_frame=t0, end_frame=t1).T,
+        T_total,
+        T_chunk,
+        windows,
+        geom[:, 1],
+        win_scale_um,
+        1 / fs,
+        xcorr_kw=full_xcorr_kw,
+        weights_kw=weights_kw,
+        thomas_kw=thomas_kw,
+        save_full=save_full,
+        pbar=pbar,
     )
-    full_xcorr_kw["max_disp_um"] = max_disp_um
-    Ss0, mincorr0 = threshold_correlation_matrix(
-        Cs0,
-        mincorr=mincorr,
-        mincorr_percentile=mincorr_percentile,
-        **threshold_kw,
-    )
-    if save_full:
-        extra["D"] = [Ds0]
-        extra["C"] = [Cs0]
-        extra["S"] = [Ss0]
-        extra["D01"] = []
-        extra["C01"] = []
-        extra["S01"] = []
-    extra["mincorrs"] = [mincorr0]
-    extra["max_disp_um"] = max_disp_um
-    P_online[:, t0:t1], _ = thomas_solve(Ds0, Ss0, **thomas_kw)
-
-    # -- loop through chunks
-    chunk_starts = range(T_chunk, T_total, T_chunk)
-    if pbar:
-        chunk_starts = trange(
-            T_chunk,
-            T_total,
-            T_chunk,
-            desc=f"Online chunks [{chunk_len_s}s each]",
-        )
-    for t1 in chunk_starts:
-        t2 = min(T_total, t1 + T_chunk)
-        traces1 = lfp_recording.get_traces(start_frame=t1, end_frame=t2)
-
-        # cross-correlations between prev/cur chunks
-        # these are T1, T0 shaped
-        Ds10, Cs10, _ = xcorr_windows(
-            traces1.T,
-            windows,
-            geom[:, 1],
-            win_scale_um,
-            raster_b=traces0.T,
-            **full_xcorr_kw,
-        )
-
-        # cross-correlation in current chunk
-        Ds1, Cs1, _ = xcorr_windows(
-            traces1.T, windows, geom[:, 1], win_scale_um, **full_xcorr_kw
-        )
-        Ss1, mincorr1 = threshold_correlation_matrix(
-            Cs1,
-            mincorr_percentile=mincorr_percentile,
-            mincorr=mincorr,
-            **threshold_kw,
-        )
-        Ss10, _ = threshold_correlation_matrix(
-            Cs10, mincorr=mincorr1, t_offset_bins=T_chunk, **threshold_kw
-        )
-        extra["mincorrs"].append(mincorr1)
-
-        if save_full:
-            extra["D"].append(Ds1)
-            extra["C"].append(Cs1)
-            extra["S"].append(Ss1)
-            extra["D01"].append(Ds10)
-            extra["C01"].append(Cs10)
-            extra["S01"].append(Ss10)
-
-        # solve online problem
-        P_online[:, t1:t2], _ = thomas_solve(
-            Ds1,
-            Ss1,
-            P_prev=P_online[:, t0:t1],
-            Ds_curprev=Ds10,
-            Us_curprev=Ss10,
-            Ds_prevcur=-Ds10.transpose(0, 2, 1),
-            Us_prevcur=Ss10.transpose(0, 2, 1),
-            **thomas_kw,
-        )
-
-        # update loop vars
-        t0, t1 = t1, t2
-        traces0 = traces1
+    extra.update(window_centers=window_centers, windows=windows)
 
     # -- convert to motion estimate and return
     me = get_motion_estimate(
