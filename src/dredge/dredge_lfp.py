@@ -1,6 +1,6 @@
 import numpy as np
 
-from .dredgelib import online_displacement
+from .dredgelib import online_displacement, threshold_correlation_matrix
 from .motion_util import get_motion_estimate, get_windows
 
 
@@ -17,8 +17,6 @@ def register_online_lfp(
     max_dt_s=None,
     # weighting arguments
     mincorr=0.8,
-    mincorr_percentile=None,
-    mincorr_percentile_nneighbs=20,
     soft=False,
     # low-level arguments
     thomas_kw=None,
@@ -64,10 +62,6 @@ def register_online_lfp(
     mincorr : float in [0,1]
         Minimum correlation between pairs of frames such that they will be included
         in the optimization of the displacement estimates.
-    mincorr_percentile, mincorr_percentile_nneighbs
-        If mincorr_percentile is set to a number in [0, 100], then mincorr will be replaced
-        by this percentile of the correlations of neighbors within mincorr_percentile_nneighbs
-        time bins of each other.
     device : string or torch.device
         Controls torch device
 
@@ -97,14 +91,16 @@ def register_online_lfp(
         device=device,
         **xcorr_kw,
     )
-    weights_kw = dict(
-        mincorr=mincorr,
-        mincorr_percentile=mincorr_percentile,
-        mincorr_percentile_nneighbs=mincorr_percentile_nneighbs,
-        soft=soft,
-        max_dt_s=max_dt_s,
-        do_window_weights=False,
-    )
+    def weight_fn(Cs, raster, raster_b=None, t_offset_bins=0):
+        return threshold_correlation_matrix(
+            Cs,
+            mincorr=mincorr,
+            max_dt_s=max_dt_s,
+            in_place=not save_full,
+            bin_s=1 / fs,
+            t_offset_bins=t_offset_bins,
+            soft=soft,
+        )
 
     # get windows
     windows, window_centers = get_windows(
@@ -124,9 +120,8 @@ def register_online_lfp(
         windows,
         geom[:, 1],
         win_scale_um,
-        1 / fs,
         xcorr_kw=full_xcorr_kw,
-        weights_kw=weights_kw,
+        weight_fn=weight_fn,
         thomas_kw=thomas_kw,
         save_full=save_full,
         pbar=pbar,

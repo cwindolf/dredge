@@ -147,7 +147,6 @@ def thomas_solve(
     Ds_curprev=None,
     Us_curprev=None,
     pbar=False,
-    bandwidth=None,
 ):
     """Block tridiagonal algorithm, special cased to our setting
 
@@ -288,74 +287,34 @@ def thomas_solve(
 
 
 def get_weights(
-    Ds,
-    Ss,
-    Sigma0inv_t,
     windows,
     raster,
-    dbe,
-    tbe,
-    raster_kw,
     weights_threshold_low=0.0,
     weights_threshold_high=np.inf,
-    pbar=False,
 ):
     """Compute per-time-bin weighting for each nonrigid window"""
     # determine window-weighted raster "heat" in each nonrigid window
     # as a function of time
-    assert windows.shape[1] == dbe.size - 1
-    weights = []
-    p_inds = []
-    for b in range((len(Ds))):
-        ilow, ihigh = np.flatnonzero(windows[b])[[0, -1]]
-        ihigh += 1
-        window_sliced = windows[b, ilow:ihigh]
-        weights.append(window_sliced @ raster[ilow:ihigh])
-    weights_orig = np.array(weights)
-
-    scale_fn = raster_kw["post_transform"] or raster_kw["amp_scale_fn"]
-    if isinstance(weights_threshold_low, tuple):
-        nspikes_threshold_low, amp_threshold_low = weights_threshold_low
-        unif = np.full_like(windows[0], 1 / len(windows[0]))
-        weights_threshold_low = (
-            scale_fn(amp_threshold_low) * windows @ (nspikes_threshold_low * unif)
-        )
-        weights_threshold_low = weights_threshold_low[:, None]
-    if isinstance(weights_threshold_high, tuple):
-        nspikes_threshold_high, amp_threshold_high = weights_threshold_high
-        unif = np.full_like(windows[0], 1 / len(windows[0]))
-        weights_threshold_high = (
-            scale_fn(amp_threshold_high) * windows @ (nspikes_threshold_high * unif)
-        )
-        weights_threshold_high = weights_threshold_high[:, None]
+    assert windows.shape[1] == raster.shape[0]
+    weights_orig = np.array(
+        [w[sl] @ raster[sl] for w, sl in zip(windows, get_window_domains(windows))]
+    )
     weights_thresh = weights_orig.copy()
     weights_thresh[weights_orig < weights_threshold_low] = 0
     weights_thresh[weights_orig > weights_threshold_high] = np.inf
 
-    return weights, weights_thresh, p_inds
+    return weights_orig, weights_thresh
 
 
 def threshold_correlation_matrix(
     Cs,
     mincorr=0.0,
-    mincorr_percentile=None,
-    mincorr_percentile_nneighbs=20,
     max_dt_s=0,
     in_place=False,
     bin_s=1,
     t_offset_bins: int = 0,
     soft=True,
 ):
-    if mincorr_percentile is not None:
-        diags = [
-            np.diagonal(Cs, offset=j, axis1=1, axis2=2).ravel()
-            for j in range(1, mincorr_percentile_nneighbs)
-        ]
-        mincorr = np.percentile(
-            np.concatenate(diags),
-            mincorr_percentile,
-        )
-
     # need abs to avoid -0.0s which cause numerical issues
     if in_place:
         Ss = Cs
@@ -373,30 +332,20 @@ def threshold_correlation_matrix(
         Ta, Tb = Ss.shape[-2:]
         dt_bins = np.arange(Ta)[:, None] + t_offset_bins - np.arange(Tb)[None, :]
         Ss *= np.abs(dt_bins) * bin_s <= max_dt_s
-    return Ss, mincorr
+    return Ss
 
 
 def weight_correlation_matrix(
-    Ds,
     Cs,
     windows,
     raster,
-    depth_bin_edges,
     bin_s: float,
-    raster_kw,
     raster_b: np.ndarray | None = None,
     t_offset_bins: int = 0,
     mincorr=0.0,
-    mincorr_percentile=None,
-    mincorr_percentile_nneighbs=20,
     max_dt_s=None,
-    lambda_t=DEFAULT_LAMBDA_T,
-    eps=DEFAULT_EPS,
-    do_window_weights=True,
     weights_threshold_low=0.0,
     weights_threshold_high=np.inf,
-    soft=True,
-    pbar=True,
     in_place=False,
 ):
     """Transform the correlation matrix into the weights used in optimization.
@@ -404,56 +353,28 @@ def weight_correlation_matrix(
     If raster_b is supplied, Cs[:, i, j] correlates time bin i of raster with
     time bin j of raster_b, as in xcorr_windows().
     """
-    Ds = np.asarray(Ds)
     Cs = np.asarray(Cs)
-    if Ds.ndim == 2:
-        Ds = Ds[None]
+    if Cs.ndim == 2:
         Cs = Cs[None]
-    B, T, T_ = Ds.shape
-    assert Ds.shape == Cs.shape
     extra = {}
 
-    Ss, mincorr = threshold_correlation_matrix(
+    Ss = threshold_correlation_matrix(
         Cs,
         mincorr=mincorr,
-        mincorr_percentile=mincorr_percentile,
-        mincorr_percentile_nneighbs=mincorr_percentile_nneighbs,
         max_dt_s=max_dt_s,
         bin_s=bin_s,
         t_offset_bins=t_offset_bins,
         in_place=in_place,
-        soft=soft,
     )
     extra["S"] = Ss
-    extra["mincorr"] = mincorr
 
-    if not do_window_weights:
-        return Ss, extra
-
-    weights_kw = dict(
-        weights_threshold_low=weights_threshold_low,
-        weights_threshold_high=weights_threshold_high,
-        pbar=pbar,
-    )
-    weights_orig, weights_thresh, Pind = get_weights(
-        Ds, Ss, None, windows, raster, depth_bin_edges, None, raster_kw, **weights_kw
-    )
+    thresholds = (weights_threshold_low, weights_threshold_high)
+    weights_orig, weights_thresh = get_weights(windows, raster, *thresholds)
     weights_thresh_b = weights_thresh
     if raster_b is not None:
-        _, weights_thresh_b, _ = get_weights(
-            Ds,
-            Ss,
-            None,
-            windows,
-            raster_b,
-            depth_bin_edges,
-            None,
-            raster_kw,
-            **weights_kw,
-        )
+        _, weights_thresh_b = get_weights(windows, raster_b, *thresholds)
     extra["weights_orig"] = weights_orig
     extra["weights_thresh"] = weights_thresh
-    extra["Pind"] = Pind
 
     # update noise model. we deliberately divide by zero and inf here.
     Us = Ss if in_place else np.zeros_like(Ss)
@@ -487,7 +408,6 @@ def xcorr_windows(
     pbar=True,
     centered=True,
     normalized=True,
-    masks=None,
     device=None,
 ):
     """Main computational function
@@ -521,8 +441,6 @@ def xcorr_windows(
     else:
         T1 = T0
         raster_b_ = raster_a_
-    if masks is not None:
-        masks = torch.as_tensor(masks, dtype=torch.float, device=device)
 
     # estimate each window's displacement
     Ds = np.zeros((B, T0, T1), dtype=np.float32)
@@ -549,8 +467,6 @@ def xcorr_windows(
             raster_a_[slices[b]],
             raster_b_[b_low:b_high],
             weights=window[slices[b]],
-            masks=None if masks is None else masks[slices[b]],
-            xmasks=None if masks is None else masks[b_low:b_high],
             disp=padding,
             possible_displacement=poss_disp,
             device=device,
@@ -567,8 +483,6 @@ def calc_corr_decent_pair(
     raster_a,
     raster_b,
     weights=None,
-    masks=None,
-    xmasks=None,
     disp=None,
     batch_size=512,
     normalized=True,
@@ -582,11 +496,10 @@ def calc_corr_decent_pair(
 
     Calculate TxT normalized xcorr and best displacement matrices
     Given a DxT raster, this computes normalized cross correlations for
-    all pairs of time bins at offsets in the range [-disp, disp], by
-    increments of step_size. Then it finds the best one and its
-    corresponding displacement, resulting in two TxT matrices: one for
-    the normxcorrs at the best displacement, and the matrix of the best
-    displacements.
+    all pairs of time bins at offsets in the range [-disp, disp]. Then it
+    finds the best one and its corresponding displacement, resulting in two
+    TxT matrices: one for the normxcorrs at the best displacement, and the
+    matrix of the best displacements.
 
     Arguments
     ---------
@@ -594,8 +507,6 @@ def calc_corr_decent_pair(
     batch_size : int
         How many raster rows to xcorr against the whole raster
         at once.
-    step_size : int
-        Displacement increment. Not implemented yet but easy to do.
     disp : int
         Maximum displacement
     device : torch device
@@ -603,10 +514,6 @@ def calc_corr_decent_pair(
     """
     D, Ta = raster_a.shape
     D_, Tb = raster_b.shape
-
-    # sensible default: at most half the domain.
-    if disp is None:
-        disp == D // 2
 
     # range of displacements
     if D == D_:
@@ -637,14 +544,10 @@ def calc_corr_decent_pair(
             dt_bins = 0 if dt_low <= 0 <= dt_high else min(abs(dt_low), abs(dt_high))
             if max_dt_bins and dt_bins > max_dt_bins:
                 continue
-            weights_ = weights
-            if masks is not None:
-                weights_ = masks.T[i : i + batch_size] * weights
             corr = normxcorr1d(
                 raster_a[i : i + batch_size],
                 raster_b[j : j + batch_size],
-                weights=weights_,
-                xmasks=None if xmasks is None else xmasks.T[j : j + batch_size],
+                weights=weights,
                 padding=disp,
                 normalized=normalized,
                 centered=centered,
@@ -661,7 +564,6 @@ def normxcorr1d(
     template,
     x,
     weights=None,
-    xmasks=None,
     centered=True,
     normalized=True,
     padding="same",
@@ -722,13 +624,8 @@ def normxcorr1d(
 
     # generalize over weighted / unweighted case
     device_kw = {} if conv_engine == "numpy" else dict(device=x.device)
-    if xmasks is None:
-        onesx = npx.ones((1, 1, lengthx), dtype=x.dtype, **device_kw)
-        wx = x[:, None, :]
-    else:
-        assert xmasks.shape == x.shape
-        onesx = xmasks[:, None, :]
-        wx = x[:, None, :] * onesx
+    onesx = npx.ones((1, 1, lengthx), dtype=x.dtype, **device_kw)
+    wx = x[:, None, :]
     no_weights = weights is None
     if no_weights:
         weights = npx.ones((1, 1, lengtht), dtype=x.dtype, **device_kw)
@@ -833,11 +730,9 @@ def online_displacement(
     windows: np.ndarray,
     spatial_bin_edges_um: np.ndarray,
     win_scale_um: float,
-    bin_s: float,
     xcorr_kw: dict,
-    weights_kw: dict,
+    weight_fn: Callable[..., np.ndarray],
     thomas_kw: dict,
-    raster_kw: dict | None = None,
     save_full: bool = False,
     pbar: bool = True,
 ) -> tuple[np.ndarray, dict]:
@@ -845,14 +740,14 @@ def online_displacement(
 
     get_raster(t_start, t_end) returns the raster for time bins t_start:t_end,
     with shape (windows.shape[1], t_end - t_start).
+
+    weight_fn(Cs, raster, raster_b=None, t_offset_bins=0) returns the weights
+    Us for the correlation matrices Cs, as in weight_correlation_matrix().
     """
     P = np.empty((len(windows), T_total), dtype=np.float32)
-    extra = dict(mincorrs=[])
+    extra = {}
     if save_full:
         extra.update(D=[], C=[], S=[], D01=[], C01=[], S01=[])
-    weights_kw = dict(
-        raster_kw=raster_kw, pbar=False, in_place=not save_full, **weights_kw
-    )
 
     chunk_starts = range(0, T_total, T_chunk)
     if pbar:
@@ -865,11 +760,7 @@ def online_displacement(
         Ds1, Cs1, max_disp_um = xcorr_windows(
             raster1, windows, spatial_bin_edges_um, win_scale_um, **xcorr_kw
         )
-        Us1, wextra = weight_correlation_matrix(
-            Ds1, Cs1, windows, raster1, spatial_bin_edges_um, bin_s, **weights_kw
-        )
-        mincorr1 = wextra["mincorr"]
-        extra["mincorrs"].append(mincorr1)
+        Us1 = weight_fn(Cs1, raster1)
         if save_full:
             extra["D"].append(Ds1)
             extra["C"].append(Cs1)
@@ -889,17 +780,7 @@ def online_displacement(
             t_offset_bins=t1 - t0,
             **xcorr_kw,
         )
-        Us10, _ = weight_correlation_matrix(
-            Ds10,
-            Cs10,
-            windows,
-            raster1,
-            spatial_bin_edges_um,
-            bin_s,
-            raster_b=raster0,
-            t_offset_bins=t1 - t0,
-            **dict(weights_kw, mincorr=mincorr1, mincorr_percentile=None),
-        )
+        Us10 = weight_fn(Cs10, raster1, raster_b=raster0, t_offset_bins=t1 - t0)
         if save_full:
             extra["D01"].append(Ds10)
             extra["C01"].append(Cs10)

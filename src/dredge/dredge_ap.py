@@ -5,8 +5,6 @@ from typing import Literal
 import numpy as np
 
 from .dredgelib import (
-    DEFAULT_EPS,
-    DEFAULT_LAMBDA_T,
     online_displacement,
     thomas_solve,
     weight_correlation_matrix,
@@ -31,20 +29,12 @@ def register(
     win_scale_um=450,
     win_margin_um=None,
     # weights arguments
-    do_window_weights=True,
     weights_threshold_low=0.2,
     weights_threshold_high=0.2,
-    mincorr_percentile=None,
-    mincorr_percentile_nneighbs=20,
     # raster arguments
-    amp_scale_fn=None,
-    post_transform=np.log1p,
     gaussian_smoothing_sigma_um=None,
     gaussian_smoothing_sigma_s=None,
     avg_in_bin=False,
-    count_masked_correlation=False,
-    count_bins=401,
-    count_bin_min=2,
     # low-level keyword args
     thomas_kw=None,
     xcorr_kw=None,
@@ -106,7 +96,7 @@ def register(
     win_margin_um : float
         Distance of nonrigid windows centers from the probe boundary (-1000 means there will
         be no window center within 1000um of the edge of the probe)
-    thomas_kw, xcorr_kw, raster_kw, weights_kw
+    thomas_kw, xcorr_kw
         These dictionaries allow setting parameters for fine control over the registration
     batching_mode : "full" or "online"
         "full" registers all time bins jointly. "online" uses AP version of LFP online algorithm.
@@ -132,23 +122,16 @@ def register(
     if max_dt_s:
         xcorr_kw["max_dt_bins"] = np.ceil(max_dt_s / bin_s)
     raster_kw = dict(
-        amp_scale_fn=amp_scale_fn,
-        post_transform=post_transform,
+        post_transform=np.log1p,
         gaussian_smoothing_sigma_um=gaussian_smoothing_sigma_um,
         gaussian_smoothing_sigma_s=gaussian_smoothing_sigma_s,
         bin_s=bin_s,
         bin_um=bin_um,
         avg_in_bin=avg_in_bin,
-        return_counts=count_masked_correlation,
-        count_bins=count_bins,
-        count_bin_min=count_bin_min,
     )
     weights_kw = dict(
         mincorr=mincorr,
-        mincorr_percentile=mincorr_percentile,
-        mincorr_percentile_nneighbs=mincorr_percentile_nneighbs,
         max_dt_s=max_dt_s,
-        do_window_weights=do_window_weights,
         weights_threshold_low=weights_threshold_low,
         weights_threshold_high=weights_threshold_high,
     )
@@ -157,18 +140,13 @@ def register(
     extra = {}
 
     if batching_mode == "full":
-        raster_res = spike_raster(
+        raster, spatial_bin_edges_um, time_bin_edges_s = spike_raster(
             amps,
             depths_um,
             times_s,
             **raster_kw,
         )
-        if count_masked_correlation:
-            raster, spatial_bin_edges_um, time_bin_edges_s, counts = raster_res
-        else:
-            raster, spatial_bin_edges_um, time_bin_edges_s = raster_res
     elif batching_mode == "online":
-        assert not count_masked_correlation
         spatial_bin_edges_um = get_bins(depths_um, bin_um)
         time_bin_edges_s = get_bins(times_s, bin_s)
     else:
@@ -184,13 +162,25 @@ def register(
         zero_threshold=1e-5,
         rigid=rigid,
     )
-    if save_full and count_masked_correlation:
-        extra["counts"] = counts
 
     if batching_mode == "online":
         get_raster = chunk_raster_loader(
             amps, depths_um, times_s, spatial_bin_edges_um, time_bin_edges_s, raster_kw
         )
+
+        def weight_fn(Cs, raster, raster_b=None, t_offset_bins=0):
+            Us, _ = weight_correlation_matrix(
+                Cs,
+                windows,
+                raster,
+                bin_s,
+                raster_b=raster_b,
+                t_offset_bins=t_offset_bins,
+                in_place=not save_full,
+                **weights_kw,
+            )
+            return Us
+
         displacement, oextra = online_displacement(
             get_raster,
             T_total=time_bin_edges_s.size - 1,
@@ -198,7 +188,6 @@ def register(
             windows=windows,
             spatial_bin_edges_um=spatial_bin_edges_um,
             win_scale_um=win_scale_um,
-            bin_s=bin_s,
             xcorr_kw=dict(
                 rigid=rigid,
                 bin_um=bin_um,
@@ -207,13 +196,8 @@ def register(
                 device=device,
                 **xcorr_kw,
             ),
-            weights_kw=dict(
-                lambda_t=thomas_kw.get("lambda_t", DEFAULT_LAMBDA_T),
-                eps=thomas_kw.get("eps", DEFAULT_EPS),
-                **weights_kw,
-            ),
+            weight_fn=weight_fn,
             thomas_kw=thomas_kw,
-            raster_kw=raster_kw,
             save_full=save_full,
             pbar=pbar,
         )
@@ -239,7 +223,6 @@ def register(
             max_disp_um=max_disp_um,
             pbar=pbar,
             device=device,
-            masks=(counts > 0) if count_masked_correlation else None,
             **xcorr_kw,
         )
     else:
@@ -247,18 +230,7 @@ def register(
 
     # turn Cs into weights
     Us, wextra = weight_correlation_matrix(
-        Ds,
-        Cs,
-        windows,
-        raster,
-        spatial_bin_edges_um,
-        bin_s,
-        raster_kw,
-        lambda_t=thomas_kw.get("lambda_t", DEFAULT_LAMBDA_T),
-        eps=thomas_kw.get("eps", DEFAULT_EPS),
-        pbar=pbar,
-        in_place=not save_full,
-        **weights_kw,
+        Cs, windows, raster, bin_s, in_place=not save_full, **weights_kw
     )
     extra.update({k: wextra[k] for k in wextra if k not in ("S", "U")})
     if save_full:
