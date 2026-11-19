@@ -12,6 +12,7 @@ The main registration APIs in dredge_ap and drege_lfp use these helpers.
 """
 
 import warnings
+from collections.abc import Callable
 
 import numpy as np
 from scipy import ndimage
@@ -51,18 +52,16 @@ class MotionEstimate:
         self.spatial_bin_edges_um = spatial_bin_edges_um
 
         self.time_bin_centers_s = time_bin_centers_s
-        if time_bin_edges_s is not None:
-            if time_bin_centers_s is None:
-                self.time_bin_centers_s = 0.5 * (
-                    time_bin_edges_s[1:] + time_bin_edges_s[:-1]
-                )
+        if time_bin_edges_s is not None and time_bin_centers_s is None:
+            self.time_bin_centers_s = 0.5 * (
+                time_bin_edges_s[1:] + time_bin_edges_s[:-1]
+            )
 
         self.spatial_bin_centers_um = spatial_bin_centers_um
-        if spatial_bin_edges_um is not None:
-            if spatial_bin_centers_um is None:
-                self.spatial_bin_centers_um = 0.5 * (
-                    spatial_bin_edges_um[1:] + spatial_bin_edges_um[:-1]
-                )
+        if spatial_bin_edges_um is not None and spatial_bin_centers_um is None:
+            self.spatial_bin_centers_um = 0.5 * (
+                spatial_bin_edges_um[1:] + spatial_bin_edges_um[:-1]
+            )
 
     def disp_at_s(self, t_s, depth_um=None, grid=False):
         """Get the displacement at time t_s and depth depth_um
@@ -181,7 +180,6 @@ class NonrigidMotionEstimate(MotionEstimate):
     ):
         assert displacement.ndim == 2
         if time_bin_edges_s is not None:
-            time_bin_edges_s
             assert (1 + displacement.shape[1],) == time_bin_edges_s.shape
         else:
             assert time_bin_centers_s is not None
@@ -203,6 +201,8 @@ class NonrigidMotionEstimate(MotionEstimate):
         # used below to disable RectBivariateSpline's extrapolation behavior
         # we'd rather fill in with the boundary value than make some line
         # going who knows where
+        assert self.time_bin_centers_s is not None
+        assert self.spatial_bin_centers_um is not None
         self.t_low = self.time_bin_centers_s.min()
         self.t_high = self.time_bin_centers_s.max()
         self.d_low = self.spatial_bin_centers_um.min()
@@ -322,7 +322,9 @@ def get_motion_estimate(
     if spatial_bin_centers_um is not None:
         D = spatial_bin_centers_um.shape[0]
     else:
+        assert spatial_bin_edges_um is not None
         D = spatial_bin_edges_um.shape[0] - 1
+    assert windows is not None
     assert windows.shape == (displacement.shape[0], D)
     if window_weights is None:
         window_weights = np.ones_like(displacement)
@@ -341,7 +343,7 @@ def get_motion_estimate(
 
 
 def motion_estimate_to_spikeinterface_motion(motion_est):
-    from spikeinterface.sortingcomponents.motion import Motion
+    from spikeinterface.core.motion import Motion
 
     spatial_bins_um = motion_est.spatial_bin_centers_um
     if spatial_bins_um is None:
@@ -446,7 +448,8 @@ def speed_limit_filter(
     if valid.all():
         return me
     valid_lerp = [
-        interp1d(me.time_bin_centers_s[v], d[v]) for v, d in zip(valid, displacement)
+        interp1d(me.time_bin_centers_s[v], d[v])
+        for v, d in zip(valid, displacement, strict=True)
     ]
     filtered_displacement = [vl(me.time_bin_centers_s) for vl in valid_lerp]
 
@@ -965,6 +968,7 @@ def si_get_windows(
 
     """
     if spatial_bin_centers is None:
+        assert spatial_bin_edges is not None
         spatial_bin_centers = 0.5 * (spatial_bin_edges[1:] + spatial_bin_edges[:-1])
     n = spatial_bin_centers.size
     min_ = np.min(contact_pos[:, 1]) - margin_um
@@ -1015,22 +1019,19 @@ def get_window_domains(windows):
 
 
 def spike_raster(
-    amps,
-    depths,
-    times,
-    bin_um=1.0,
-    bin_s=1.0,
-    spatial_bin_edges_um=None,
-    time_bin_edges_s=None,
-    amp_scale_fn=None,
-    gaussian_smoothing_sigma_um=0,
-    gaussian_smoothing_sigma_s=0,
-    avg_in_bin=True,
-    post_transform=None,
-    return_counts=False,
-    count_bins=31,
-    count_bin_min=5,
-):
+    amps: np.ndarray,
+    depths: np.ndarray,
+    times: np.ndarray,
+    bin_um: float = 1.0,
+    bin_s: float = 1.0,
+    spatial_bin_edges_um: np.ndarray | None = None,
+    time_bin_edges_s: np.ndarray | None = None,
+    amp_scale_fn: Callable[[np.ndarray], np.ndarray] | None = None,
+    gaussian_smoothing_sigma_um: float | None = 0,
+    gaussian_smoothing_sigma_s: float | None = 0,
+    avg_in_bin: bool = True,
+    post_transform: Callable[[np.ndarray], np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Create an image representation of spike activity
 
     Arguments
@@ -1085,69 +1086,111 @@ def spike_raster(
     if gaussian_smoothing_sigma_s is None:
         gaussian_smoothing_sigma_s = bin_s
 
-    if return_counts:
-        counts = np.histogram2d(
-            depths,
-            times,
-            bins=(spatial_bin_edges_um, time_bin_edges_s),
-        )[0]
-        counts = counts >= count_bin_min
-        structure = np.zeros((count_bins, 1), dtype=counts.dtype)
-        structure[: count_bins // 2 + 1] = 1
-        countsup = ndimage.binary_dilation(counts, structure=structure)
-        countsdown = ndimage.binary_dilation(counts, structure=structure[::-1])
-        countsmiddle = ndimage.binary_dilation(
-            counts, structure=np.ones((count_bins // 2 + 1, 1), dtype=counts.dtype)
+    raster_shape = (time_bin_edges_s.size - 1, spatial_bin_edges_um.size - 1)
+    raster = np.zeros(raster_shape, dtype=np.float32)
+    accumulate_spike_raster(
+        raster,
+        depths=depths,
+        times=times,
+        weights=weights,
+        spatial_bin_edges_um=spatial_bin_edges_um,
+        time_bin_edges_s=time_bin_edges_s,
+    )
+    if avg_in_bin:
+        counts = np.zeros(raster_shape, dtype=np.float32)
+        accumulate_spike_raster(
+            counts,
+            depths=depths,
+            times=times,
+            weights=None,
+            spatial_bin_edges_um=spatial_bin_edges_um,
+            time_bin_edges_s=time_bin_edges_s,
         )
-        counts = np.logical_and(countsup, countsdown)
-        counts = np.logical_and(counts, countsmiddle)
-    else:
-        counts = 1
+        np.maximum(counts, 1.0, out=counts)
+        np.divide(raster, counts, out=raster)
+        del counts
 
-    r = np.histogram2d(
-        depths,
+    finalize_spike_raster(
+        raster,
+        bin_um=bin_um,
+        bin_s=bin_s,
+        gaussian_smoothing_sigma_um=gaussian_smoothing_sigma_um,
+        gaussian_smoothing_sigma_s=gaussian_smoothing_sigma_s,
+        post_transform=post_transform,
+    )
+
+    return raster.T, spatial_bin_edges_um, time_bin_edges_s
+
+
+def accumulate_spike_raster(
+    raster: np.ndarray,
+    *,
+    depths: np.ndarray,
+    times: np.ndarray,
+    weights: np.ndarray | None,
+    spatial_bin_edges_um: np.ndarray,
+    time_bin_edges_s: np.ndarray,
+) -> None:
+    """Add a new batch of spikes into the raster."""
+    assert depths.shape == times.shape
+    assert weights is None or weights.shape == times.shape
+    assert raster.shape == (time_bin_edges_s.size - 1, spatial_bin_edges_um.size - 1)
+    if not times.size:
+        return
+
+    n_time_bins = raster.shape[0]
+    t0 = np.searchsorted(time_bin_edges_s, times.min(), side="right") - 1
+    t1 = np.searchsorted(time_bin_edges_s, times.max(), side="right")
+    t0 = min(max(t0, 0), n_time_bins - 1)
+    t1 = min(max(t1, 1), n_time_bins)
+
+    raster[t0:t1] += np.histogram2d(
         times,
-        bins=(spatial_bin_edges_um, time_bin_edges_s),
+        depths,
+        bins=(time_bin_edges_s[t0 : t1 + 1], spatial_bin_edges_um),
         weights=weights,
     )[0]
-    if avg_in_bin:
-        r /= np.maximum(
-            1,
-            np.histogram2d(
-                depths,
-                times,
-                bins=(spatial_bin_edges_um, time_bin_edges_s),
-            )[0],
-        )
 
-    if gaussian_smoothing_sigma_um:
-        r = gaussian_filter1d(
-            r * counts, gaussian_smoothing_sigma_um / bin_um, axis=0, mode="constant"
-        )
-        r[counts == 0] = 0
-        if return_counts:
-            w_up = gaussian_filter1d(
-                counts, gaussian_smoothing_sigma_um / bin_um, axis=0, mode="constant"
+
+def finalize_spike_raster(
+    raster: np.ndarray,
+    *,
+    bin_um: float,
+    bin_s: float,
+    gaussian_smoothing_sigma_um: float,
+    gaussian_smoothing_sigma_s: float,
+    post_transform: Callable[[np.ndarray], np.ndarray] | None,
+    time_bins_per_block: int = 4096,
+) -> None:
+    n_time_bins = raster.shape[0]
+
+    for t0 in range(0, n_time_bins, time_bins_per_block):
+        rcur = raster[t0 : t0 + time_bins_per_block]
+        if gaussian_smoothing_sigma_um:
+            rcur[...] = gaussian_filter1d(
+                rcur, gaussian_smoothing_sigma_um / bin_um, axis=1, mode="constant"
             )
-            w_up[w_up == 0] = 1
-            r /= w_up
+        if post_transform is not None:
+            rcur[...] = post_transform(rcur)
 
-    if post_transform is not None:
-        r = post_transform(r)
+    if not gaussian_smoothing_sigma_s:
+        return
 
-    if gaussian_smoothing_sigma_s:
-        r = gaussian_filter1d(
-            r * counts, gaussian_smoothing_sigma_s / bin_s, axis=1, mode="constant"
-        )
-        r[counts == 0] = 0
-        if return_counts:
-            w = gaussian_filter1d(
-                counts, gaussian_smoothing_sigma_s / bin_s, axis=1, mode="constant"
-            )
-            w[w == 0] = 1
-            r /= w
+    sigma_bins = gaussian_smoothing_sigma_s / bin_s
+    pad = int(4.0 * sigma_bins + 0.5)
+    assert time_bins_per_block >= pad
 
-    if return_counts:
-        return r, spatial_bin_edges_um, time_bin_edges_s, counts
-
-    return r, spatial_bin_edges_um, time_bin_edges_s
+    rprev = None
+    t0prev = 0
+    for t0 in range(0, n_time_bins, time_bins_per_block):
+        t1 = min(n_time_bins, t0 + time_bins_per_block)
+        lo = max(0, t0 - pad)
+        hi = min(n_time_bins, t1 + pad)
+        rcur = np.array(raster[lo:hi])
+        rcur = gaussian_filter1d(rcur, sigma_bins, axis=0, mode="constant")
+        rcur = rcur[t0 - lo : t1 - lo]
+        if rprev is not None:
+            raster[t0prev : t0prev + rprev.shape[0]] = rprev
+        rprev, t0prev = rcur, t0
+    if rprev is not None:
+        raster[t0prev : t0prev + rprev.shape[0]] = rprev
