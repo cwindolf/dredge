@@ -1,5 +1,6 @@
 import gc
-from collections.abc import Callable
+from collections.abc import Iterable
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -10,13 +11,13 @@ from .dredgelib import (
     weight_correlation_matrix,
     xcorr_windows,
 )
-from .motion_util import get_bins, get_motion_estimate, get_windows, spike_raster
+from .motion_util import get_motion_estimate, get_windows, spike_raster
 
 
 def register(
-    amps,
-    depths_um,
-    times_s,
+    amps: np.ndarray | None = None,
+    depths_um: np.ndarray | None = None,
+    times_s: np.ndarray | None = None,
     rigid=False,
     bin_um=1.0,
     bin_s=1.0,
@@ -35,6 +36,9 @@ def register(
     gaussian_smoothing_sigma_um=None,
     gaussian_smoothing_sigma_s=None,
     avg_in_bin=False,
+    spike_batches: Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None,
+    low_memory: bool = False,
+    tmpdir: Path | None = None,
     # low-level keyword args
     thomas_kw=None,
     xcorr_kw=None,
@@ -61,7 +65,13 @@ def register(
     depths: np.array of shape (n_spikes,)
     times : np.array of shape (n_spikes,)
         The amplitudes, depths (microns) and times (seconds) of input
-        spike events.
+        spike events. Optional, you can also pass spike_batches for a
+        streaming setup, see next doc entry.
+    spike_batches : optional iterable of 3-tuples of arrays
+        Needs to be re-iterable, two passes are needed! Streaming raster
+        creation to avoid holding all spikes in ram. See also low_memory.
+    low_memory, tmpdir
+        Required together for a low-memory memmap setup; see spike_raster.
     rigid : bool, default=False
         If True, ignore the nonrigid window args (win_shape, win_step_um, win_scale_um,
         win_margin_um) and do rigid registration (equivalent to one flat window, which
@@ -117,18 +127,12 @@ def register(
         windows if one wants to visualize them. Set `save_full` to also save displacement
         and correlation matrices.
     """
+    if batching_mode not in ("full", "online"):
+        raise ValueError(f"Unknown {batching_mode=}.")
     thomas_kw = thomas_kw if thomas_kw is not None else {}
     xcorr_kw = xcorr_kw if xcorr_kw is not None else {}
     if max_dt_s:
         xcorr_kw["max_dt_bins"] = np.ceil(max_dt_s / bin_s)
-    raster_kw = dict(
-        post_transform=np.log1p,
-        gaussian_smoothing_sigma_um=gaussian_smoothing_sigma_um,
-        gaussian_smoothing_sigma_s=gaussian_smoothing_sigma_s,
-        bin_s=bin_s,
-        bin_um=bin_um,
-        avg_in_bin=avg_in_bin,
-    )
     weights_kw = dict(
         mincorr=mincorr,
         max_dt_s=max_dt_s,
@@ -139,18 +143,20 @@ def register(
     # this will store return values other than the MotionEstimate
     extra = {}
 
-    if batching_mode == "full":
-        raster, spatial_bin_edges_um, time_bin_edges_s = spike_raster(
-            amps,
-            depths_um,
-            times_s,
-            **raster_kw,
-        )
-    elif batching_mode == "online":
-        spatial_bin_edges_um = get_bins(depths_um, bin_um)
-        time_bin_edges_s = get_bins(times_s, bin_s)
-    else:
-        raise ValueError(f"Unknown {batching_mode=}.")
+    raster, spatial_bin_edges_um, time_bin_edges_s = spike_raster(
+        amps,
+        depths_um,
+        times_s,
+        bin_um=bin_um,
+        bin_s=bin_s,
+        gaussian_smoothing_sigma_um=gaussian_smoothing_sigma_um,
+        gaussian_smoothing_sigma_s=gaussian_smoothing_sigma_s,
+        avg_in_bin=avg_in_bin,
+        post_transform=np.log1p,
+        spike_batches=spike_batches,
+        low_memory=low_memory,
+        tmpdir=tmpdir,
+    )
     windows, window_centers = get_windows(
         # pseudo geom to fool spikeinterface
         np.c_[np.zeros_like(spatial_bin_edges_um), spatial_bin_edges_um],
@@ -164,9 +170,6 @@ def register(
     )
 
     if batching_mode == "online":
-        get_raster = chunk_raster_loader(
-            amps, depths_um, times_s, spatial_bin_edges_um, time_bin_edges_s, raster_kw
-        )
 
         def weight_fn(Cs, raster, raster_b=None, t_offset_bins=0):
             Us, _ = weight_correlation_matrix(
@@ -182,7 +185,7 @@ def register(
             return Us
 
         displacement, oextra = online_displacement(
-            get_raster,
+            lambda t0, t1: np.ascontiguousarray(raster[:, t0:t1]),
             T_total=time_bin_edges_s.size - 1,
             T_chunk=max(1, int(np.ceil(chunk_len_s / bin_s))),
             windows=windows,
@@ -259,41 +262,3 @@ def register(
     extra["max_disp_um"] = max_disp_um
 
     return me, extra
-
-
-def chunk_raster_loader(
-    amps: np.ndarray,
-    depths_um: np.ndarray,
-    times_s: np.ndarray,
-    spatial_bin_edges_um: np.ndarray,
-    time_bin_edges_s: np.ndarray,
-    raster_kw: dict,
-) -> Callable[[int, int], np.ndarray]:
-    """Online raster chunk builder"""
-    if np.any(np.diff(times_s) < 0):
-        order = np.argsort(times_s, kind="stable")
-        amps, depths_um, times_s = amps[order], depths_um[order], times_s[order]
-
-    bin_s = raster_kw["bin_s"]
-    sigma_s = raster_kw["gaussian_smoothing_sigma_s"]
-    if sigma_s is None:
-        sigma_s = bin_s
-    pad = int(4.0 * sigma_s / bin_s + 0.5) if sigma_s else 0
-    T = time_bin_edges_s.size - 1
-
-    def get_raster(t_start: int, t_end: int) -> np.ndarray:
-        lo = max(0, t_start - pad)
-        hi = min(T, t_end + pad)
-        i0 = np.searchsorted(times_s, time_bin_edges_s[lo])
-        i1 = times_s.size if hi == T else np.searchsorted(times_s, time_bin_edges_s[hi])
-        raster, *_ = spike_raster(
-            amps[i0:i1],
-            depths_um[i0:i1],
-            times_s[i0:i1],
-            spatial_bin_edges_um=spatial_bin_edges_um,
-            time_bin_edges_s=time_bin_edges_s[lo : hi + 1],
-            **raster_kw,
-        )
-        return raster[:, t_start - lo : t_end - lo]
-
-    return get_raster

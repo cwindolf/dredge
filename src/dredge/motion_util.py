@@ -11,8 +11,10 @@ This library has 3 sections:
 The main registration APIs in dredge_ap and drege_lfp use these helpers.
 """
 
+import tempfile
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
+from pathlib import Path
 
 import numpy as np
 from scipy import ndimage
@@ -1019,9 +1021,9 @@ def get_window_domains(windows):
 
 
 def spike_raster(
-    amps: np.ndarray,
-    depths: np.ndarray,
-    times: np.ndarray,
+    amps: np.ndarray | None = None,
+    depths: np.ndarray | None = None,
+    times: np.ndarray | None = None,
     bin_um: float = 1.0,
     bin_s: float = 1.0,
     spatial_bin_edges_um: np.ndarray | None = None,
@@ -1031,6 +1033,10 @@ def spike_raster(
     gaussian_smoothing_sigma_s: float | None = 0,
     avg_in_bin: bool = True,
     post_transform: Callable[[np.ndarray], np.ndarray] | None = None,
+    spike_batches: Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None,
+    low_memory: bool = False,
+    tmpdir: Path | None = None,
+    time_bins_per_block: int = 4096,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Create an image representation of spike activity
 
@@ -1038,6 +1044,7 @@ def spike_raster(
     ---------
     amps, depths, times : 1D np.arrays all of same length
         Amplitudes, depths (microns), times (seconds) of spike events
+        Optional, can pass spike_batches instead.
     bin_um : float
         Spatial bin size (microns)
     bin_s : float
@@ -1057,6 +1064,11 @@ def spike_raster(
     post_transform : None or a function
         If supplied, this function is applied to the final raster before
         reurning.
+    spike_batches : optional iterable of 3-tuples of arrays
+        Needs to be re-iterable, two passes are needed! Streaming raster
+        creation to avoid holding all spikes in ram. See also low_memory.
+    low_memory, tmpdir
+        Store raster in a memmap if supplied.
 
     Returns
     -------
@@ -1067,18 +1079,31 @@ def spike_raster(
     time_bin_edges_s : 1D np.array
         The n_time_bins_bins + 1 temporal bin edges
     """
-    assert amps.shape == depths.shape == times.shape
-    assert amps.ndim == 1
+    if (amps is None) == (spike_batches is None):
+        raise ValueError("Pass either amps+depths+times or spike_batches")
+    if low_memory and tmpdir is None:
+        raise ValueError("low_memory=True requires tmpdir")
+    if spike_batches is None:
+        assert amps is not None and depths is not None and times is not None
+        assert amps.shape == depths.shape == times.shape
+        assert amps.ndim == 1
+        spike_batches = [(amps, depths, times)]
+    assert not isinstance(spike_batches, Iterator)
 
-    if spatial_bin_edges_um is None:
-        spatial_bin_edges_um = get_bins(depths, bin_um)
-    if time_bin_edges_s is None:
-        time_bin_edges_s = get_bins(times, bin_s)
-
-    if amp_scale_fn is None:
-        weights = amps
-    else:
-        weights = amp_scale_fn(amps)
+    if spatial_bin_edges_um is None or time_bin_edges_s is None:
+        zlo = tlo = np.inf
+        zhi = thi = -np.inf
+        for _, dd, tt in spike_batches:
+            if not tt.size:
+                continue
+            zlo = min(zlo, dd.min())
+            zhi = max(zhi, dd.max())
+            tlo = min(tlo, tt.min())
+            thi = max(thi, tt.max())
+        if spatial_bin_edges_um is None:
+            spatial_bin_edges_um = get_bins(np.array([zlo, zhi]), bin_um)
+        if time_bin_edges_s is None:
+            time_bin_edges_s = get_bins(np.array([tlo, thi]), bin_s)
 
     if gaussian_smoothing_sigma_um is None:
         gaussian_smoothing_sigma_um = bin_um
@@ -1087,83 +1112,46 @@ def spike_raster(
         gaussian_smoothing_sigma_s = bin_s
 
     raster_shape = (time_bin_edges_s.size - 1, spatial_bin_edges_um.size - 1)
-    raster = np.zeros(raster_shape, dtype=np.float32)
-    accumulate_spike_raster(
-        raster,
-        depths=depths,
-        times=times,
-        weights=weights,
-        spatial_bin_edges_um=spatial_bin_edges_um,
-        time_bin_edges_s=time_bin_edges_s,
-    )
-    if avg_in_bin:
+    if low_memory:
+        with tempfile.NamedTemporaryFile(
+            prefix="raster", suffix=".npy", dir=tmpdir, delete=False
+        ) as npy_file:
+            raster = np.lib.format.open_memmap(
+                npy_file.name, mode="w+", dtype=np.float32, shape=raster_shape
+            )
+    else:
+        raster = np.zeros(raster_shape, dtype=np.float32)
+    counts = None
+    if avg_in_bin and low_memory:
+        with tempfile.NamedTemporaryFile(
+            prefix="counts", suffix=".npy", dir=tmpdir, delete=False
+        ) as npy_file:
+            counts = np.lib.format.open_memmap(
+                npy_file.name, mode="w+", dtype=np.float32, shape=raster_shape
+            )
+    elif avg_in_bin:
         counts = np.zeros(raster_shape, dtype=np.float32)
+
+    for aa, dd, tt in spike_batches:
         accumulate_spike_raster(
+            raster,
             counts,
-            depths=depths,
-            times=times,
-            weights=None,
+            amps=aa,
+            depths=dd,
+            times=tt,
+            amp_scale_fn=amp_scale_fn,
             spatial_bin_edges_um=spatial_bin_edges_um,
             time_bin_edges_s=time_bin_edges_s,
         )
+    if counts is not None:
         np.maximum(counts, 1.0, out=counts)
         np.divide(raster, counts, out=raster)
+        counts_npy = getattr(counts, "filename", None)
         del counts
-
-    finalize_spike_raster(
-        raster,
-        bin_um=bin_um,
-        bin_s=bin_s,
-        gaussian_smoothing_sigma_um=gaussian_smoothing_sigma_um,
-        gaussian_smoothing_sigma_s=gaussian_smoothing_sigma_s,
-        post_transform=post_transform,
-    )
-
-    return raster.T, spatial_bin_edges_um, time_bin_edges_s
-
-
-def accumulate_spike_raster(
-    raster: np.ndarray,
-    *,
-    depths: np.ndarray,
-    times: np.ndarray,
-    weights: np.ndarray | None,
-    spatial_bin_edges_um: np.ndarray,
-    time_bin_edges_s: np.ndarray,
-) -> None:
-    """Add a new batch of spikes into the raster."""
-    assert depths.shape == times.shape
-    assert weights is None or weights.shape == times.shape
-    assert raster.shape == (time_bin_edges_s.size - 1, spatial_bin_edges_um.size - 1)
-    if not times.size:
-        return
+        if counts_npy is not None:
+            Path(counts_npy).unlink()
 
     n_time_bins = raster.shape[0]
-    t0 = np.searchsorted(time_bin_edges_s, times.min(), side="right") - 1
-    t1 = np.searchsorted(time_bin_edges_s, times.max(), side="right")
-    t0 = min(max(t0, 0), n_time_bins - 1)
-    t1 = min(max(t1, 1), n_time_bins)
-
-    raster[t0:t1] += np.histogram2d(
-        times,
-        depths,
-        bins=(time_bin_edges_s[t0 : t1 + 1], spatial_bin_edges_um),
-        weights=weights,
-    )[0]
-
-
-def finalize_spike_raster(
-    raster: np.ndarray,
-    *,
-    bin_um: float,
-    bin_s: float,
-    gaussian_smoothing_sigma_um: float,
-    gaussian_smoothing_sigma_s: float,
-    post_transform: Callable[[np.ndarray], np.ndarray] | None,
-    time_bins_per_block: int = 4096,
-) -> None:
-    n_time_bins = raster.shape[0]
-
     for t0 in range(0, n_time_bins, time_bins_per_block):
         rcur = raster[t0 : t0 + time_bins_per_block]
         if gaussian_smoothing_sigma_um:
@@ -1174,7 +1162,7 @@ def finalize_spike_raster(
             rcur[...] = post_transform(rcur)
 
     if not gaussian_smoothing_sigma_s:
-        return
+        return raster.T, spatial_bin_edges_um, time_bin_edges_s
 
     sigma_bins = gaussian_smoothing_sigma_s / bin_s
     pad = int(4.0 * sigma_bins + 0.5)
@@ -1194,3 +1182,36 @@ def finalize_spike_raster(
         rprev, t0prev = rcur, t0
     if rprev is not None:
         raster[t0prev : t0prev + rprev.shape[0]] = rprev
+
+    return raster.T, spatial_bin_edges_um, time_bin_edges_s
+
+
+def accumulate_spike_raster(
+    raster: np.ndarray,
+    counts: np.ndarray | None,
+    *,
+    amps: np.ndarray,
+    depths: np.ndarray,
+    times: np.ndarray,
+    amp_scale_fn: Callable[[np.ndarray], np.ndarray] | None,
+    spatial_bin_edges_um: np.ndarray,
+    time_bin_edges_s: np.ndarray,
+) -> None:
+    """Add a new batch of spikes into the raster."""
+    assert amps.shape == depths.shape == times.shape
+    assert raster.shape == (time_bin_edges_s.size - 1, spatial_bin_edges_um.size - 1)
+    assert counts is None or counts.shape == raster.shape
+    if not times.size:
+        return
+
+    n_time_bins = raster.shape[0]
+    t0 = np.searchsorted(time_bin_edges_s, times.min(), side="right") - 1
+    t1 = np.searchsorted(time_bin_edges_s, times.max(), side="right")
+    t0 = min(max(t0, 0), n_time_bins - 1)
+    t1 = min(max(t1, 1), n_time_bins)
+
+    bins = (time_bin_edges_s[t0 : t1 + 1], spatial_bin_edges_um)
+    weights = amps if amp_scale_fn is None else amp_scale_fn(amps)
+    raster[t0:t1] += np.histogram2d(times, depths, bins=bins, weights=weights)[0]
+    if counts is not None:
+        counts[t0:t1] += np.histogram2d(times, depths, bins=bins)[0]
