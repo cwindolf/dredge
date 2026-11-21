@@ -39,6 +39,12 @@ def register(
     spike_batches: Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None,
     low_memory: bool = False,
     tmpdir: Path | None = None,
+    raster: np.ndarray | None = None,
+    spatial_bin_edges_um: np.ndarray | None = None,
+    time_bin_edges_s: np.ndarray | None = None,
+    depth_limits_um: tuple[float, float] | None = None,
+    time_limits_s: tuple[float, float] | None = None,
+    n_jobs: int = 0,
     # low-level keyword args
     thomas_kw=None,
     xcorr_kw=None,
@@ -72,6 +78,11 @@ def register(
         creation to avoid holding all spikes in ram. See also low_memory.
     low_memory, tmpdir
         Required together for a low-memory memmap setup; see spike_raster.
+    raster, spatial_bin_edges_um, time_bin_edges_s : arrays
+        Precomputed raster, which should be already smoothed and amp_scaled, with
+        the bin metadata!
+    depth_limits_um, time_limits_s, n_jobs
+        Passed to spike_raster
     rigid : bool, default=False
         If True, ignore the nonrigid window args (win_shape, win_step_um, win_scale_um,
         win_margin_um) and do rigid registration (equivalent to one flat window, which
@@ -143,20 +154,32 @@ def register(
     # this will store return values other than the MotionEstimate
     extra = {}
 
-    raster, spatial_bin_edges_um, time_bin_edges_s = spike_raster(
-        amps,
-        depths_um,
-        times_s,
-        bin_um=bin_um,
-        bin_s=bin_s,
-        gaussian_smoothing_sigma_um=gaussian_smoothing_sigma_um,
-        gaussian_smoothing_sigma_s=gaussian_smoothing_sigma_s,
-        avg_in_bin=avg_in_bin,
-        post_transform=np.log1p,
-        spike_batches=spike_batches,
-        low_memory=low_memory,
-        tmpdir=tmpdir,
-    )
+    if raster is None:
+        raster, spatial_bin_edges_um, time_bin_edges_s = spike_raster(
+            amps,
+            depths_um,
+            times_s,
+            bin_um=bin_um,
+            bin_s=bin_s,
+            spatial_bin_edges_um=spatial_bin_edges_um,
+            time_bin_edges_s=time_bin_edges_s,
+            depth_limits_um=depth_limits_um,
+            time_limits_s=time_limits_s,
+            gaussian_smoothing_sigma_um=gaussian_smoothing_sigma_um,
+            gaussian_smoothing_sigma_s=gaussian_smoothing_sigma_s,
+            avg_in_bin=avg_in_bin,
+            post_transform=np.log1p,
+            spike_batches=spike_batches,
+            low_memory=low_memory,
+            tmpdir=tmpdir,
+            n_jobs=n_jobs,
+        )
+    else:
+        assert amps is None and spike_batches is None
+    assert spatial_bin_edges_um is not None and time_bin_edges_s is not None
+    assert raster.shape == (spatial_bin_edges_um.size - 1, time_bin_edges_s.size - 1)
+    assert np.allclose(np.diff(spatial_bin_edges_um), bin_um)
+    assert np.allclose(np.diff(time_bin_edges_s), bin_s)
     windows, window_centers = get_windows(
         # pseudo geom to fool spikeinterface
         np.c_[np.zeros_like(spatial_bin_edges_um), spatial_bin_edges_um],

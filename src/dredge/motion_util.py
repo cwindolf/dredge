@@ -11,9 +11,13 @@ This library has 3 sections:
 The main registration APIs in dredge_ap and drege_lfp use these helpers.
 """
 
+import multiprocessing
 import tempfile
 import warnings
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -1028,6 +1032,8 @@ def spike_raster(
     bin_s: float = 1.0,
     spatial_bin_edges_um: np.ndarray | None = None,
     time_bin_edges_s: np.ndarray | None = None,
+    depth_limits_um: tuple[float, float] | None = None,
+    time_limits_s: tuple[float, float] | None = None,
     amp_scale_fn: Callable[[np.ndarray], np.ndarray] | None = None,
     gaussian_smoothing_sigma_um: float | None = 0,
     gaussian_smoothing_sigma_s: float | None = 0,
@@ -1037,6 +1043,8 @@ def spike_raster(
     low_memory: bool = False,
     tmpdir: Path | None = None,
     time_bins_per_block: int = 4096,
+    n_jobs: int = 0,
+    mp_context: str = "spawn",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Create an image representation of spike activity
 
@@ -1053,6 +1061,9 @@ def spike_raster(
         Optional. If you already know what bins you want to use, supply
         them here. Otherwise, bins are determined based on bin_um/bin_s
         and the depths and times.
+    depth_limits_um, time_limits_s
+        Raster bounds in microns and seconds, which helps long recordings using
+        spike_batches to process them in one pass. Ignore these if that's not you.
     amp_scale_fn : None or a function
         Apply this function to amplitudes. None (default) means leave them as
         they are. For instance, you could use np.log1p to scale the amplitudes
@@ -1069,6 +1080,8 @@ def spike_raster(
         creation to avoid holding all spikes in ram. See also low_memory.
     low_memory, tmpdir
         Store raster in a memmap if supplied.
+    n_jobs, mp_context
+        Controls parallelism when using spike_batches.
 
     Returns
     -------
@@ -1090,6 +1103,12 @@ def spike_raster(
         spike_batches = [(amps, depths, times)]
     assert not isinstance(spike_batches, Iterator)
 
+    if depth_limits_um is not None:
+        assert spatial_bin_edges_um is None
+        spatial_bin_edges_um = get_bins(np.array(depth_limits_um), bin_um)
+    if time_limits_s is not None:
+        assert time_bin_edges_s is None
+        time_bin_edges_s = get_bins(np.array(time_limits_s), bin_s)
     if spatial_bin_edges_um is None or time_bin_edges_s is None:
         zlo = tlo = np.inf
         zhi = thi = -np.inf
@@ -1104,6 +1123,8 @@ def spike_raster(
             spatial_bin_edges_um = get_bins(np.array([zlo, zhi]), bin_um)
         if time_bin_edges_s is None:
             time_bin_edges_s = get_bins(np.array([tlo, thi]), bin_s)
+    for edges in (spatial_bin_edges_um, time_bin_edges_s):
+        assert np.allclose(np.diff(edges), edges[1] - edges[0])
 
     if gaussian_smoothing_sigma_um is None:
         gaussian_smoothing_sigma_um = bin_um
@@ -1132,17 +1153,44 @@ def spike_raster(
     elif avg_in_bin:
         counts = np.zeros(raster_shape, dtype=np.float32)
 
-    for aa, dd, tt in spike_batches:
-        accumulate_spike_raster(
-            raster,
-            counts,
-            amps=aa,
-            depths=dd,
-            times=tt,
-            amp_scale_fn=amp_scale_fn,
-            spatial_bin_edges_um=spatial_bin_edges_um,
-            time_bin_edges_s=time_bin_edges_s,
+    histogram_fn = partial(
+        spike_histogram,
+        amp_scale_fn=amp_scale_fn,
+        spatial_bin_edges_um=spatial_bin_edges_um,
+        time_bin_edges_s=time_bin_edges_s,
+        with_counts=counts is not None,
+    )
+    if n_jobs > 1 and isinstance(spike_batches, Sequence) and len(spike_batches) > 1:
+        pool = ProcessPoolExecutor(
+            max_workers=n_jobs,
+            mp_context=multiprocessing.get_context(mp_context),
+            initializer=_init_histogram_worker,
+            initargs=(spike_batches, histogram_fn),
         )
+        batch_histograms = pool.map(_worker_histogram, range(len(spike_batches)))
+    else:
+        pool = nullcontext()
+        batch_histograms = (
+            histogram_fn(amps=aa, depths=dd, times=tt) for aa, dd, tt in spike_batches
+        )
+
+    time_lo, time_hi = raster_shape[0], 0
+    depth_lo, depth_hi = raster_shape[1], 0
+    with pool:
+        for batch_histogram in batch_histograms:
+            if batch_histogram is None:
+                continue
+            t0, z0, batch_raster, batch_counts = batch_histogram
+            t1 = t0 + batch_raster.shape[0]
+            z1 = z0 + batch_raster.shape[1]
+            raster[t0:t1, z0:z1] += batch_raster
+            if counts is not None:
+                assert batch_counts is not None
+                counts[t0:t1, z0:z1] += batch_counts
+            time_lo = min(time_lo, t0)
+            time_hi = max(time_hi, t1)
+            depth_lo = min(depth_lo, z0)
+            depth_hi = max(depth_hi, z1)
     if counts is not None:
         np.maximum(counts, 1.0, out=counts)
         np.divide(raster, counts, out=raster)
@@ -1150,6 +1198,15 @@ def spike_raster(
         del counts
         if counts_npy is not None:
             Path(counts_npy).unlink()
+
+    if depth_limits_um is not None:
+        assert depth_lo < depth_hi
+        raster = raster[:, depth_lo:depth_hi]
+        spatial_bin_edges_um = spatial_bin_edges_um[depth_lo : depth_hi + 1]
+    if time_limits_s is not None:
+        assert time_lo < time_hi
+        raster = raster[time_lo:time_hi]
+        time_bin_edges_s = time_bin_edges_s[time_lo : time_hi + 1]
 
     n_time_bins = raster.shape[0]
     for t0 in range(0, n_time_bins, time_bins_per_block):
@@ -1186,9 +1243,7 @@ def spike_raster(
     return raster.T, spatial_bin_edges_um, time_bin_edges_s
 
 
-def accumulate_spike_raster(
-    raster: np.ndarray,
-    counts: np.ndarray | None,
+def spike_histogram(
     *,
     amps: np.ndarray,
     depths: np.ndarray,
@@ -1196,22 +1251,61 @@ def accumulate_spike_raster(
     amp_scale_fn: Callable[[np.ndarray], np.ndarray] | None,
     spatial_bin_edges_um: np.ndarray,
     time_bin_edges_s: np.ndarray,
-) -> None:
-    """Add a new batch of spikes into the raster."""
+    with_counts: bool,
+) -> tuple[int, int, np.ndarray, np.ndarray | None] | None:
     assert amps.shape == depths.shape == times.shape
-    assert raster.shape == (time_bin_edges_s.size - 1, spatial_bin_edges_um.size - 1)
-    assert counts is None or counts.shape == raster.shape
-    if not times.size:
-        return
+    time_ix, time_in_range = _bin_index(times, time_bin_edges_s)
+    depth_ix, depth_in_range = _bin_index(depths, spatial_bin_edges_um)
+    valid = np.flatnonzero(np.logical_and(time_in_range, depth_in_range))
+    del time_in_range, depth_in_range
+    if not valid.size:
+        return None
 
-    n_time_bins = raster.shape[0]
-    t0 = np.searchsorted(time_bin_edges_s, times.min(), side="right") - 1
-    t1 = np.searchsorted(time_bin_edges_s, times.max(), side="right")
-    t0 = min(max(t0, 0), n_time_bins - 1)
-    t1 = min(max(t1, 1), n_time_bins)
+    time_ix = time_ix[valid]
+    depth_ix = depth_ix[valid]
+    t0 = time_ix.min()
+    z0 = depth_ix.min()
+    n_time_bins = time_ix.max() - t0 + 1
+    n_depth_bins = depth_ix.max() - z0 + 1
+    flat_ix = (time_ix - t0) * n_depth_bins + (depth_ix - z0)
+    del time_ix, depth_ix
 
-    bins = (time_bin_edges_s[t0 : t1 + 1], spatial_bin_edges_um)
-    weights = amps if amp_scale_fn is None else amp_scale_fn(amps)
-    raster[t0:t1] += np.histogram2d(times, depths, bins=bins, weights=weights)[0]
-    if counts is not None:
-        counts[t0:t1] += np.histogram2d(times, depths, bins=bins)[0]
+    weights = amps[valid]
+    if amp_scale_fn is not None:
+        weights = amp_scale_fn(weights)
+    shape = (n_time_bins, n_depth_bins)
+    raster = np.bincount(flat_ix, weights=weights, minlength=n_time_bins * n_depth_bins)
+    raster = raster.reshape(shape)
+    counts = None
+    if with_counts:
+        counts = np.bincount(flat_ix, minlength=n_time_bins * n_depth_bins)
+        counts = counts.reshape(shape)
+    return int(t0), int(z0), raster, counts
+
+
+def _bin_index(x: np.ndarray, edges: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    n_bins = edges.size - 1
+    ix = np.floor((x - edges[0]) / (edges[1] - edges[0])).astype(np.intp)
+    np.clip(ix, 0, n_bins - 1, out=ix)
+    ix -= x < edges[ix]
+    ix += x >= edges[ix + 1]
+    np.clip(ix, 0, n_bins - 1, out=ix)
+    in_range = np.logical_and(x >= edges[0], x <= edges[-1])
+    return ix, in_range
+
+
+_worker_spike_batches: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None
+_worker_histogram_fn: Callable | None = None
+
+
+def _init_histogram_worker(spike_batches, histogram_fn):
+    global _worker_spike_batches, _worker_histogram_fn
+    _worker_spike_batches = spike_batches
+    _worker_histogram_fn = histogram_fn
+
+
+def _worker_histogram(i: int):
+    assert _worker_spike_batches is not None
+    assert _worker_histogram_fn is not None
+    amps, depths, times = _worker_spike_batches[i]
+    return _worker_histogram_fn(amps=amps, depths=depths, times=times)
