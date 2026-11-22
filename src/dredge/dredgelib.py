@@ -1,5 +1,5 @@
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import scipy.linalg as la
@@ -57,6 +57,7 @@ def neg_hessian_likelihood_term(Ub, Ub_prevcur=None, Ub_curprev=None):
     if Ub_prevcur is None:
         np.fill_diagonal(negHUb, diagonal_terms)
     else:
+        assert Ub_curprev is not None
         diagonal_terms += Ub_prevcur.sum(0) + Ub_curprev.sum(1)
         np.fill_diagonal(negHUb, diagonal_terms)
     return negHUb
@@ -84,6 +85,8 @@ def newton_rhs(
         return grad_at_0
 
     # online case
+    assert Ub_prevcur is not None
+    assert Db_curprev is not None
     align_term = (Ub_prevcur.T + Ub_curprev) @ Pb_prev
     rhs = (
         align_term
@@ -130,7 +133,7 @@ def newton_solve_rigid(
     try:
         p = solve(Sigma0inv + negHU, targ, assume_a="pos")
     except np.linalg.LinAlgError:
-        warnings.warn("Singular problem, using least squares.")
+        warnings.warn("Singular problem, using least squares.", stacklevel=2)
         p, *_ = la.lstsq(Sigma0inv + negHU, targ)
     return p, negHU
 
@@ -146,6 +149,9 @@ def thomas_solve(
     Us_prevcur=None,
     Ds_curprev=None,
     Us_curprev=None,
+    lambda_anchor: float = 0.0,
+    anchor_block_bins: int | None = None,
+    max_dt_bins: int | None = None,
     pbar=False,
 ):
     """Block tridiagonal algorithm, special cased to our setting
@@ -164,6 +170,14 @@ def thomas_solve(
     If arguments `P_prev,Ds_prevcur,Us_prevcur` are supplied, this code handles the
     online case. The return value will be the new chunk's displacement estimate,
     solving the online registration problem.
+
+    If lambda_anchor and anchor_block_bins are provided, then an additional prior
+    penalizes the squared mean of the displacement (with coefficient lambda_anchor)
+    in blocks of length anchor_block_bins. This is useful if the displacement is
+    being parametrized as a residual after modding out some coarse displacement estimate.
+    This also includes the "active" mask stuff done for the ridge to avoid penalizing
+    silent areas etc. The strength is relative to a relevant pair count so that it
+    does not need adjusting when terms like the bin size or max_dt change.
     """
     Ds = np.asarray(Ds, dtype=np.float64)
     Us = np.asarray(Us, dtype=np.float64)
@@ -181,6 +195,8 @@ def thomas_solve(
     if online:
         assert Ds_prevcur is not None
         assert Us_prevcur is not None
+        assert Ds_curprev is not None
+        assert Us_curprev is not None
         # priors' terms linking each window's first bin to P_prev's last bin
         p_last = P_prev[:, -1].astype(np.float64)
         prior_rhs = np.zeros((B, T))
@@ -213,13 +229,26 @@ def thomas_solve(
         laplacian(T, eps=eps, lambd=lambda_t, ridge_mask=w, wink_start=not online)
         for w in had_weights
     ]
-    extra = dict(L_t=L_t)
+
+    # add in residual anchor
+    if lambda_anchor:
+        assert anchor_block_bins is not None
+        max_dt_bins = T if max_dt_bins is None else min(max_dt_bins, T)
+        bdary_pairs = np.minimum(np.arange(1, max_dt_bins + 1), anchor_block_bins).sum()
+        for L, w in zip(L_t, had_weights, strict=True):
+            for i0 in range(0, T, anchor_block_bins):
+                active = i0 + np.flatnonzero(w[i0 : i0 + anchor_block_bins])  # ty: ignore[invalid-argument-type]
+                if not active.size:
+                    continue
+                anchor_active_strength = lambda_anchor * bdary_pairs / active.size**2
+                L[active[:, None], active[None, :]] += anchor_active_strength
+    extra: dict[str, Sequence[np.ndarray] | np.ndarray] = dict(L_t=L_t)
 
     # just solve independent problems when there's no spatial regularization
     # not that there's much overhead to the backward pass etc but might as well
     if B == 1 or lambda_s == 0:
         P = np.zeros((B, T))
-        extra["HU"] = np.zeros((B, T, T))
+        extra["HU"] = np.zeros((B, T, T), dtype="float32")
         for b in range(B):
             P[b], extra["HU"][b] = newton_solve_rigid(
                 Ds[b], Us[b], L_t[b], **online_kw_rhs(b)
@@ -296,9 +325,10 @@ def get_weights(
     # determine window-weighted raster "heat" in each nonrigid window
     # as a function of time
     assert windows.shape[1] == raster.shape[0]
-    weights_orig = np.array(
-        [w[sl] @ raster[sl] for w, sl in zip(windows, get_window_domains(windows))]
-    )
+    domains = get_window_domains(windows)
+    weights_orig = np.empty((len(windows), raster.shape[1]), dtype=raster.dtype)
+    for w, sl, row in zip(windows, domains, weights_orig, strict=True):
+        row[:] = w[sl] @ raster[sl]
     weights_thresh = weights_orig.copy()
     weights_thresh[weights_orig < weights_threshold_low] = 0
     weights_thresh[weights_orig > weights_threshold_high] = np.inf
@@ -518,6 +548,7 @@ def calc_corr_decent_pair(
     # range of displacements
     if D == D_:
         if possible_displacement is None:
+            assert disp is not None
             possible_displacement = np.arange(-disp, disp + 1)
     else:
         assert possible_displacement is not None
@@ -620,7 +651,7 @@ def normxcorr1d(
 
     x = npx.atleast_2d(x)
     num_templates, lengtht = template.shape
-    num_inputs, lengthx = x.shape
+    _num_inputs, lengthx = x.shape
 
     # generalize over weighted / unweighted case
     device_kw = {} if conv_engine == "numpy" else dict(device=x.device)
@@ -636,7 +667,7 @@ def normxcorr1d(
         elif weights.shape == (num_templates, lengtht):
             weights = weights[:, None, :]
         else:
-            assert False
+            assert False  # noqa: B011
         wt = template[:, None, :] * weights
     x = x[:, None, :]
     template = template[:, None, :]
@@ -649,13 +680,13 @@ def normxcorr1d(
     # compute expectations
     # how many points in each window? seems necessary to normalize
     # for numerical stability.
-    Nx = conv1d(onesx, weights, padding=padding)  # 1,nt,l
+    Nx = conv1d(onesx, weights, padding=padding)  # 1,nt,l  # ty: ignore[no-matching-overload]
     empty = Nx == 0
     Nx[empty] = 1
     if centered:
-        Et = conv1d(onesx, wt, padding=padding)  # 1,nt,l
+        Et = conv1d(onesx, wt, padding=padding)  # 1,nt,l  # ty: ignore[no-matching-overload]
         Et /= Nx
-        Ex = conv1d(wx, weights, padding=padding)  # nx,nt,l
+        Ex = conv1d(wx, weights, padding=padding)  # nx,nt,l  # ty: ignore[no-matching-overload]
         Ex /= Nx
 
     # compute (weighted) covariance
@@ -669,9 +700,9 @@ def normxcorr1d(
 
     # compute variances for denominator, using var X = E[X^2] - (EX)^2
     if normalized:
-        var_template = conv1d(onesx, wt * template, padding=padding)
+        var_template = conv1d(onesx, wt * template, padding=padding)  # ty: ignore[no-matching-overload]
         var_template /= Nx
-        var_x = conv1d(wx * x, weights, padding=padding)
+        var_x = conv1d(wx * x, weights, padding=padding)  # ty: ignore[no-matching-overload]
         var_x /= Nx
         if centered:
             var_template -= npx.square(Et)
