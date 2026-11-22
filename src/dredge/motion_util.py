@@ -741,7 +741,20 @@ def show_lfp_me_traces(
 # -- metrics plots
 
 
-def masked_template_correlation(a, z, t, motion_est, geom, margin=0):
+def masked_template_correlation(
+    a=None,
+    z=None,
+    t=None,
+    motion_est=None,
+    geom=None,
+    margin=0,
+    spike_batches=None,
+    time_limits_s=None,
+    n_jobs=0,
+    low_memory=False,
+    tmpdir=None,
+    time_bins_per_block=4096,
+):
     """A metric showing registration quality over time
 
     A raster plot of spike positions over time is computed. Then,
@@ -749,40 +762,75 @@ def masked_template_correlation(a, z, t, motion_est, geom, margin=0):
     But, there is a twist, which is that positions outside the probe
     are masked out in these computations so that empty space isn't
     counted towards the correlations.
+
+    Most args are forwarded to spike_raster.
     """
-    z_reg = motion_est.correct_s(t, z)
+    assert motion_est is not None
+    assert geom is not None
+    probe_low = geom[:, 1].min() - margin
+    probe_high = geom[:, 1].max() + margin
 
     # throw away spikes which are way off in space before computing the metric
     max_disp = np.abs(motion_est.displacement).max()
-    z_reg_low = geom[:, 1].min() - margin - max_disp
-    z_reg_high = geom[:, 1].max() + margin + max_disp
-    inlying = z_reg == np.clip(z_reg, z_reg_low, z_reg_high)
-    a = a[inlying]
-    z = z[inlying]
-    z_reg = z_reg[inlying]
-    t = t[inlying]
 
     # get registered raster map
-    raster, dbe, tbe = spike_raster(a, z_reg, t)
+    raster, dbe, tbe = spike_raster(
+        a,
+        z,
+        t,
+        depth_limits_um=(probe_low - max_disp, probe_high + max_disp),
+        time_limits_s=time_limits_s,
+        spike_batches=spike_batches,
+        low_memory=low_memory,
+        tmpdir=tmpdir,
+        time_bins_per_block=time_bins_per_block,
+        n_jobs=n_jobs,
+        motion_est=motion_est,
+    )
 
     # mask out raster regions which are outside the drifting probe
     dbc = 0.5 * (dbe[1:] + dbe[:-1])
     tbc = 0.5 * (tbe[1:] + tbe[:-1])
-    for t in range(len(tbe) - 1):
-        glo = motion_est.correct_s(t, geom[:, 1].min() - margin)
-        ghi = motion_est.correct_s(t, geom[:, 1].max() + margin)
-        outside = dbc != np.clip(dbc, glo, ghi)
-        raster[outside, t] = np.nan
+    glo = motion_est.correct_s(tbc, np.full_like(tbc, probe_low))
+    ghi = motion_est.correct_s(tbc, np.full_like(tbc, probe_high))
 
     # compute a masked template and masked correlations to it
+    n_time_bins = tbc.size
+    template_sum = np.zeros(dbc.shape)
+    template_count = np.zeros(dbc.shape)
+    nan_corr_trace = np.zeros(tbc.shape)
     with warnings.catch_warnings():
         warnings.filterwarnings(
             action="ignore", category=RuntimeWarning, message="Mean of empty slice"
         )
-        nan_template = np.nanmean(raster, axis=1)
+        warnings.filterwarnings(
+            action="ignore",
+            category=RuntimeWarning,
+            message="invalid value encountered in divide",
+        )
+        for t0 in range(0, n_time_bins, time_bins_per_block):
+            t1 = min(n_time_bins, t0 + time_bins_per_block)
+            block = raster[:, t0:t1]
+            outside = np.logical_or(
+                dbc[:, None] < glo[None, t0:t1], dbc[:, None] > ghi[None, t0:t1]
+            )
+            block[outside] = np.nan
+            template_sum += np.nansum(block, axis=1)
+            template_count += np.logical_not(outside).sum(axis=1)
+            del block, outside
+        nan_template = np.divide(
+            template_sum,
+            template_count,
+            out=np.full(dbc.shape, np.nan),
+            where=template_count > 0,
+        )
         temp = (nan_template - np.nanmean(nan_template)) / np.nanstd(nan_template)
-        r = (raster - np.nanmean(raster, 0)[None]) / np.nanstd(raster, 0)[None]
-        nan_corr_trace = np.nanmean(temp[:, None] * r, 0)
+        for t0 in range(0, n_time_bins, time_bins_per_block):
+            t1 = min(n_time_bins, t0 + time_bins_per_block)
+            block = raster[:, t0:t1]
+            r = (block - np.nanmean(block, 0)[None]) / np.nanstd(block, 0)[None]
+            nan_corr_trace[t0:t1] = np.nanmean(temp[:, None] * r, 0)
+            del block, r
 
     return dict(
         raster=raster,
@@ -1045,6 +1093,7 @@ def spike_raster(
     time_bins_per_block: int = 4096,
     n_jobs: int = 0,
     mp_context: str = "spawn",
+    motion_est: MotionEstimate | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Create an image representation of spike activity
 
@@ -1082,6 +1131,8 @@ def spike_raster(
         Store raster in a memmap if supplied.
     n_jobs, mp_context
         Controls parallelism when using spike_batches.
+    motion_est : optional MotionEstimate
+        If supplied, a motion-corrected raster is computed.
 
     Returns
     -------
@@ -1115,6 +1166,8 @@ def spike_raster(
         for _, dd, tt in spike_batches:
             if not tt.size:
                 continue
+            if motion_est is not None:
+                dd = motion_est.correct_s(tt, dd)
             zlo = min(zlo, dd.min())
             zhi = max(zhi, dd.max())
             tlo = min(tlo, tt.min())
@@ -1159,6 +1212,7 @@ def spike_raster(
         spatial_bin_edges_um=spatial_bin_edges_um,
         time_bin_edges_s=time_bin_edges_s,
         with_counts=counts is not None,
+        motion_est=motion_est,
     )
     if n_jobs > 1 and isinstance(spike_batches, Sequence) and len(spike_batches) > 1:
         pool = ProcessPoolExecutor(
@@ -1252,8 +1306,11 @@ def spike_histogram(
     spatial_bin_edges_um: np.ndarray,
     time_bin_edges_s: np.ndarray,
     with_counts: bool,
+    motion_est: MotionEstimate | None,
 ) -> tuple[int, int, np.ndarray, np.ndarray | None] | None:
     assert amps.shape == depths.shape == times.shape
+    if motion_est is not None:
+        depths = motion_est.correct_s(times, depths)
     time_ix, time_in_range = _bin_index(times, time_bin_edges_s)
     depth_ix, depth_in_range = _bin_index(depths, spatial_bin_edges_um)
     valid = np.flatnonzero(np.logical_and(time_in_range, depth_in_range))
