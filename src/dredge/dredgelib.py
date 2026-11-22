@@ -78,22 +78,17 @@ def newton_rhs(
     The gradient at P=0 of the cost function, which is the right hand side of Newton's method.
     """
     UDb = Ub * Db
-    grad_at_0 = UDb.sum(1) - UDb.sum(0)
-
-    # batch case
-    if Pb_prev is None:
-        return grad_at_0
+    # initialize with likelihood gradient at p=0
+    rhs = UDb.sum(1) - UDb.sum(0)
 
     # online case
-    assert Ub_prevcur is not None
-    assert Db_curprev is not None
-    align_term = (Ub_prevcur.T + Ub_curprev) @ Pb_prev
-    rhs = (
-        align_term
-        + grad_at_0
-        + (Ub_curprev * Db_curprev).sum(1)
-        - (Ub_prevcur * Db_prevcur).sum(0)
-    )
+    if Pb_prev is not None:
+        assert Ub_prevcur is not None
+        assert Db_curprev is not None
+        rhs += (Ub_prevcur.T + Ub_curprev) @ Pb_prev
+        rhs += (Ub_curprev * Db_curprev).sum(1)
+        rhs -= (Ub_prevcur * Db_prevcur).sum(0)
+
     if prior_rhs is not None:
         rhs += prior_rhs
 
@@ -152,6 +147,7 @@ def thomas_solve(
     lambda_anchor: float = 0.0,
     anchor_block_bins: int | None = None,
     max_dt_bins: int | None = None,
+    anchor_target: np.ndarray | None = None,
     pbar=False,
 ):
     """Block tridiagonal algorithm, special cased to our setting
@@ -172,15 +168,17 @@ def thomas_solve(
     solving the online registration problem.
 
     If lambda_anchor and anchor_block_bins are provided, then an additional prior
-    penalizes the squared mean of the displacement (with coefficient lambda_anchor)
+    penalizes the squared mean of the displacement (weighted based on lambda_anchor)
     in blocks of length anchor_block_bins. This is useful if the displacement is
     being parametrized as a residual after modding out some coarse displacement estimate.
     This also includes the "active" mask stuff done for the ridge to avoid penalizing
     silent areas etc. The strength is relative to a relevant pair count so that it
     does not need adjusting when terms like the bin size or max_dt change.
+    The anchor target is used with the above to correct the residual mean away from 0
+    when needed (interpolation of motion est, averaging over "active" bins).
     """
-    Ds = np.asarray(Ds, dtype=np.float64)
-    Us = np.asarray(Us, dtype=np.float64)
+    Ds = np.asarray(Ds)
+    Us = np.asarray(Us)
     B, T, T_ = Ds.shape
     assert T == T_
     assert Us.shape == Ds.shape
@@ -192,6 +190,7 @@ def thomas_solve(
 
     online = P_prev is not None
     online_kw_rhs = online_kw_hess = lambda b: {}
+    prior_rhs = np.zeros((B, T))
     if online:
         assert Ds_prevcur is not None
         assert Us_prevcur is not None
@@ -199,7 +198,6 @@ def thomas_solve(
         assert Us_curprev is not None
         # priors' terms linking each window's first bin to P_prev's last bin
         p_last = P_prev[:, -1].astype(np.float64)
-        prior_rhs = np.zeros((B, T))
         prior_rhs[:, 0] = 0.5 * lambda_t * p_last
         if B > 1 and lambda_s:
             prior_rhs[:, 0] += 0.5 * lambd_s_diag * p_last
@@ -211,7 +209,6 @@ def thomas_solve(
             Ub_prevcur=Us_prevcur[b].astype(np.float64, copy=False),
             Db_curprev=Ds_curprev[b].astype(np.float64, copy=False),
             Ub_curprev=Us_curprev[b].astype(np.float64, copy=False),
-            prior_rhs=prior_rhs[b],
         )
         online_kw_hess = lambda b: dict(  # noqa
             Ub_prevcur=Us_prevcur[b].astype(np.float64, copy=False),
@@ -235,13 +232,19 @@ def thomas_solve(
         assert anchor_block_bins is not None
         max_dt_bins = T if max_dt_bins is None else min(max_dt_bins, T)
         bdary_pairs = np.minimum(np.arange(1, max_dt_bins + 1), anchor_block_bins).sum()
-        for L, w in zip(L_t, had_weights, strict=True):
+        if anchor_target is not None:
+            assert anchor_target.shape == (B, T)
+        for b, (L, w) in enumerate(zip(L_t, had_weights, strict=True)):
             for i0 in range(0, T, anchor_block_bins):
                 active = i0 + np.flatnonzero(w[i0 : i0 + anchor_block_bins])  # ty: ignore[invalid-argument-type]
                 if not active.size:
                     continue
                 anchor_active_strength = lambda_anchor * bdary_pairs / active.size**2
                 L[active[:, None], active[None, :]] += anchor_active_strength
+                if anchor_target is not None:
+                    prior_rhs[b, active] += (
+                        anchor_active_strength * anchor_target[b, active].sum()
+                    )
     extra: dict[str, Sequence[np.ndarray] | np.ndarray] = dict(L_t=L_t)
 
     # just solve independent problems when there's no spatial regularization
@@ -251,7 +254,11 @@ def thomas_solve(
         extra["HU"] = np.zeros((B, T, T), dtype="float32")
         for b in range(B):
             P[b], extra["HU"][b] = newton_solve_rigid(
-                Ds[b], Us[b], L_t[b], **online_kw_rhs(b)
+                Ds[b].astype(np.float64, copy=False),
+                Us[b].astype(np.float64, copy=False),
+                L_t[b],
+                prior_rhs=prior_rhs[b],
+                **online_kw_rhs(b),
             )
         return P, extra
 
@@ -266,12 +273,13 @@ def thomas_solve(
     Lambda_s_offdiag = laplacian(T, eps=0, lambd=lambd_s_offdiag, wink_start=not online)
 
     # initialize block-LU stuff and forward variable
-    alpha_hat_b = (
-        L_t[0]
-        + Lambda_s_diagb
-        + neg_hessian_likelihood_term(Us[0], **online_kw_hess(0))
-    )
-    targets = np.c_[Lambda_s_offdiag, newton_rhs(Us[0], Ds[0], **online_kw_rhs(0))]
+    Ub = Us[0].astype(np.float64, copy=False)
+    Db = Ds[0].astype(np.float64, copy=False)
+    alpha_hat_b = L_t[0] + Lambda_s_diagb + neg_hessian_likelihood_term(Ub, **online_kw_hess(0))
+    targets = np.c_[
+        Lambda_s_offdiag,
+        newton_rhs(Db, Ub, prior_rhs=prior_rhs[0], **online_kw_rhs(0)),
+    ]
     res = solve(alpha_hat_b, targets, assume_a="pos")
     assert res.shape == (T, T + 1)
     gamma_hats = [res[:, :T]]
@@ -287,13 +295,11 @@ def thomas_solve(
             wink_start=not online,
         )
 
-        Ab = (
-            L_t[b]
-            + Lambda_s_diagb
-            + neg_hessian_likelihood_term(Us[b], **online_kw_hess(b))
-        )
+        Ub = Us[b].astype(np.float64, copy=False)
+        Db = Ds[b].astype(np.float64, copy=False)
+        Ab = L_t[b] + Lambda_s_diagb + neg_hessian_likelihood_term(Ub, **online_kw_hess(b))
         alpha_hat_b = Ab - Lambda_s_offdiag @ gamma_hats[b - 1]
-        targets[:, T] = newton_rhs(Us[b], Ds[b], **online_kw_rhs(b))
+        targets[:, T] = newton_rhs(Db, Ub, prior_rhs=prior_rhs[b], **online_kw_rhs(b))
         targets[:, T] -= Lambda_s_offdiag @ ys[b - 1]
         res = solve(alpha_hat_b, targets)
         assert res.shape == (T, T + 1)
@@ -764,6 +770,7 @@ def online_displacement(
     xcorr_kw: dict,
     weight_fn: Callable[..., np.ndarray],
     thomas_kw: dict,
+    anchor_target: np.ndarray | None = None,
     save_full: bool = False,
     pbar: bool = True,
 ) -> tuple[np.ndarray, dict]:
@@ -774,6 +781,8 @@ def online_displacement(
 
     weight_fn(Cs, raster, raster_b=None, t_offset_bins=0) returns the weights
     Us for the correlation matrices Cs, as in weight_correlation_matrix().
+
+    anchor_target optionally adjusts likelihood term in coarse-guided solve
     """
     P = np.empty((len(windows), T_total), dtype=np.float32)
     extra = {}
@@ -787,6 +796,7 @@ def online_displacement(
     for t1 in chunk_starts:
         t2 = min(T_total, t1 + T_chunk)
         raster1 = get_raster(t1, t2)
+        target1 = None if anchor_target is None else anchor_target[:, t1:t2]
 
         Ds1, Cs1, max_disp_um = xcorr_windows(
             raster1, windows, spatial_bin_edges_um, win_scale_um, **xcorr_kw
@@ -798,7 +808,7 @@ def online_displacement(
             extra["S"].append(Us1)
 
         if raster0 is None:
-            P[:, t1:t2], _ = thomas_solve(Ds1, Us1, **thomas_kw)
+            P[:, t1:t2], _ = thomas_solve(Ds1, Us1, anchor_target=target1, **thomas_kw)
             t0, raster0 = t1, raster1
             continue
 
@@ -825,6 +835,7 @@ def online_displacement(
             Us_curprev=Us10,
             Ds_prevcur=-Ds10.transpose(0, 2, 1),
             Us_prevcur=Us10.transpose(0, 2, 1),
+            anchor_target=target1,
             **thomas_kw,
         )
         t0, raster0 = t1, raster1

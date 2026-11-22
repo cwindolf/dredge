@@ -11,7 +11,7 @@ from .dredgelib import (
     weight_correlation_matrix,
     xcorr_windows,
 )
-from .motion_util import get_motion_estimate, get_windows, spike_raster
+from .motion_util import MotionEstimate, get_motion_estimate, get_windows, spike_raster
 
 
 def register(
@@ -49,8 +49,14 @@ def register(
     thomas_kw=None,
     xcorr_kw=None,
     # online mode
-    batching_mode: Literal["full", "online"] = "full",
+    batching_mode: Literal["full", "online", "coarse_guided_online"] = "full",
     chunk_len_s: float = 3000.0,
+    # coarse-guided online mode
+    coarse_bin_s: float = 600.0,
+    coarse_max_dt_s: float | None = None,
+    fine_max_disp_um: float | None = None,
+    lambda_anchor: float = 0.03,
+    coarse_motion_est: MotionEstimate | None = None,
     # misc
     device=None,
     pbar=True,
@@ -123,6 +129,15 @@ def register(
         "full" registers all time bins jointly. "online" uses AP version of LFP online algorithm.
     chunk_len_s : float
         Chunk length for batching_mode="online".
+    coarse_bin_s, coarse_max_dt_s, fine_max_disp_um, lambda_anchor, coarse_motion_est
+        These flags control behavior when batching_mode="coarse_guided_online".
+        There is a "full-mode" solve done at coarse_bin_s resolution which guides (in the code
+        sometimes called "anchoring") a fine-scale solve which uses the online method.
+        The coarse-guided online solve step runs on a raster that has been shifted by the
+        coarse estimate, and some extra terms are added to the prior and the target to keep
+        the online method "anchored" to the full solve. It should help avoid accumulating
+        errors from limited-horizon online stuff. I thought about also doing a backward pass
+        or some kind of full joint solve; this seems good enough for now.
     device : str or torch.device
         What torch device to run on? E.g., "cpu" or "cuda" or "cuda:1".
 
@@ -138,23 +153,64 @@ def register(
         windows if one wants to visualize them. Set `save_full` to also save displacement
         and correlation matrices.
     """
-    if batching_mode not in ("full", "online"):
+    if batching_mode not in ("full", "online", "coarse_guided_online"):
         raise ValueError(f"Unknown {batching_mode=}.")
+
+    if batching_mode == "coarse_guided_online" and coarse_motion_est is None:
+        assert raster is None
+        # get the coarse motion estimate
+        coarse_motion_est, coarse_extra = register(
+            amps,
+            depths_um,
+            times_s,
+            rigid=rigid,
+            bin_um=bin_um,
+            bin_s=coarse_bin_s,
+            max_disp_um=max_disp_um,
+            max_dt_s=coarse_max_dt_s,
+            mincorr=mincorr,
+            win_shape=win_shape,
+            win_step_um=win_step_um,
+            win_scale_um=win_scale_um,
+            win_margin_um=win_margin_um,
+            weights_threshold_low=weights_threshold_low,
+            weights_threshold_high=weights_threshold_high,
+            gaussian_smoothing_sigma_um=gaussian_smoothing_sigma_um,
+            gaussian_smoothing_sigma_s=0.0,
+            avg_in_bin=avg_in_bin,
+            spike_batches=spike_batches,
+            low_memory=low_memory,
+            tmpdir=tmpdir,
+            spatial_bin_edges_um=spatial_bin_edges_um,
+            depth_limits_um=depth_limits_um,
+            time_limits_s=time_limits_s,
+            n_jobs=n_jobs,
+            batching_mode="full",
+            device=device,
+            pbar=pbar,
+        )
+        if fine_max_disp_um is None:
+            fine_max_disp_um = coarse_extra["max_disp_um"] / 3
+        del coarse_extra
+    if batching_mode == "coarse_guided_online":
+        assert coarse_motion_est is not None
+        assert coarse_motion_est.time_bin_edges_s is not None
+        assert fine_max_disp_um is not None
+        if coarse_motion_est.time_bin_edges_s.size < 3:
+            batching_mode = "online"
+            coarse_motion_est = None
+
     thomas_kw = thomas_kw if thomas_kw is not None else {}
     xcorr_kw = xcorr_kw if xcorr_kw is not None else {}
     if max_dt_s:
         xcorr_kw["max_dt_bins"] = np.ceil(max_dt_s / bin_s)
-    weights_kw = dict(
-        mincorr=mincorr,
-        max_dt_s=max_dt_s,
-        weights_threshold_low=weights_threshold_low,
-        weights_threshold_high=weights_threshold_high,
-    )
 
     # this will store return values other than the MotionEstimate
     extra = {}
 
     if raster is None:
+        # if coarse-guided, then coarse_motion_est will cause the raster to
+        # be roughly registered before fine scale registration
         raster, spatial_bin_edges_um, time_bin_edges_s = spike_raster(
             amps,
             depths_um,
@@ -173,6 +229,7 @@ def register(
             low_memory=low_memory,
             tmpdir=tmpdir,
             n_jobs=n_jobs,
+            motion_est=coarse_motion_est,
         )
     else:
         assert amps is None and spike_batches is None
@@ -192,7 +249,36 @@ def register(
         rigid=rigid,
     )
 
-    if batching_mode == "online":
+    if batching_mode == "online" or batching_mode == "coarse_guided_online":
+        guide = anchor_target = None
+        if coarse_motion_est is not None:
+            time_bin_centers_s = 0.5 * (time_bin_edges_s[1:] + time_bin_edges_s[:-1])
+            guide = coarse_motion_est.disp_at_s(
+                time_bin_centers_s, depth_um=window_centers, grid=True
+            )
+            guide = np.broadcast_to(guide, (len(windows), time_bin_centers_s.size))
+            coarse_edges_s = coarse_motion_est.time_bin_edges_s
+            assert coarse_edges_s is not None
+            assert coarse_motion_est.time_bin_centers_s is not None
+            coarse_ix = (
+                np.searchsorted(coarse_edges_s, time_bin_centers_s, side="right") - 1
+            )
+            np.clip(coarse_ix, 0, coarse_edges_s.size - 2, out=coarse_ix)
+            anchor_target = coarse_motion_est.disp_at_s(
+                coarse_motion_est.time_bin_centers_s[coarse_ix],
+                depth_um=window_centers,
+                grid=True,
+            )
+            anchor_target = np.broadcast_to(anchor_target, guide.shape) - guide
+            del coarse_ix
+            anchor_block_bins = round(coarse_bin_s / bin_s)
+            assert np.isclose(anchor_block_bins * bin_s, coarse_bin_s)
+            thomas_kw = dict(
+                thomas_kw,
+                lambda_anchor=lambda_anchor,
+                anchor_block_bins=anchor_block_bins,
+                max_dt_bins=int(np.ceil(max_dt_s / bin_s)) if max_dt_s else None,
+            )
 
         def weight_fn(Cs, raster, raster_b=None, t_offset_bins=0):
             Us, _ = weight_correlation_matrix(
@@ -203,7 +289,10 @@ def register(
                 raster_b=raster_b,
                 t_offset_bins=t_offset_bins,
                 in_place=not save_full,
-                **weights_kw,
+                mincorr=mincorr,
+                max_dt_s=max_dt_s,
+                weights_threshold_low=weights_threshold_low,
+                weights_threshold_high=weights_threshold_high,
             )
             return Us
 
@@ -217,17 +306,22 @@ def register(
             xcorr_kw=dict(
                 rigid=rigid,
                 bin_um=bin_um,
-                max_disp_um=max_disp_um,
+                max_disp_um=max_disp_um if guide is None else fine_max_disp_um,
                 pbar=False,
                 device=device,
                 **xcorr_kw,
             ),
             weight_fn=weight_fn,
             thomas_kw=thomas_kw,
+            anchor_target=anchor_target,
             save_full=save_full,
             pbar=pbar,
         )
         extra.update(oextra)
+        if guide is not None:
+            displacement = displacement + guide
+            extra["coarse_motion_est"] = coarse_motion_est
+        del guide, anchor_target
         me = get_motion_estimate(
             displacement,
             spatial_bin_centers_um=window_centers,
@@ -256,7 +350,15 @@ def register(
 
     # turn Cs into weights
     Us, wextra = weight_correlation_matrix(
-        Cs, windows, raster, bin_s, in_place=not save_full, **weights_kw
+        Cs,
+        windows,
+        raster,
+        bin_s,
+        in_place=not save_full,
+        mincorr=mincorr,
+        max_dt_s=max_dt_s,
+        weights_threshold_low=weights_threshold_low,
+        weights_threshold_high=weights_threshold_high,
     )
     extra.update({k: wextra[k] for k in wextra if k not in ("S", "U")})
     if save_full:
